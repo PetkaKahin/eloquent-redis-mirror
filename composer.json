@@ -1,0 +1,33 @@
+{
+    "name": "petkakahin/eloquent-redis-mirror",
+    "autoload": {
+        "psr-4": {
+            "PetkaKahin\\EloquentRedisMirror\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "PetkaKahin\\EloquentRedisMirror\\Tests\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Petka Kahin",
+            "email": "gradik.st@gmail.com"
+        }
+    ],
+    "version": "0.0.1",
+    "require": {
+        "php": "^8.4"
+    },
+    "require-dev": {
+        "orchestra/testbench": "*",
+        "pestphp/pest": "^4.4",
+        "pestphp/pest-plugin-laravel": "^4.1"
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    }
+}
