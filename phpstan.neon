@@ -1,0 +1,46 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    paths:
+        - src
+    level: max
+    ignoreErrors:
+        # Trait is used by models in application code, PHPStan can't detect external usage
+        - identifier: trait.unused
+
+        # Redis pipeline callback receives a pipe object that PHPStan can't type
+        - identifier: method.nonObject
+          path: src/Repository/RedisRepository.php
+
+        # Eloquent Model::getKey()/getAttribute() returns mixed by design
+        - identifier: binaryOp.invalid
+          path: src/Builder/RedisBuilder.php
+        - identifier: cast.string
+          path: src/Builder/RedisBuilder.php
+        - identifier: offsetAccess.invalidOffset
+          path: src/Builder/RedisBuilder.php
+        - identifier: binaryOp.invalid
+          path: src/Listeners/SyncRedisHash.php
+        - identifier: cast.string
+          path: src/Listeners/SyncRedisHash.php
+        - identifier: cast.string
+          path: src/Listeners/SyncRedisPivot.php
+
+
+        # Dynamic relation calls return mixed
+        - message: '#Cannot call method get\(\) on mixed#'
+          path: src/Builder/RedisBuilder.php
+
+        # parent::sync/toggle return types are loosely typed in Laravel
+        - identifier: return.type
+          path: src/Relations/RedisBelongsToMany.php
+        - identifier: argument.type
+          path: src/Relations/RedisBelongsToMany.php
+
+        # array_values on a known list is harmless
+        - identifier: arrayValues.list
+
+        # loadRedisRelation array key type mismatch (int vs int|string)
+        - message: '#loadRedisRelation\(\) expects array<int#'
+          path: src/Builder/RedisBuilder.php
