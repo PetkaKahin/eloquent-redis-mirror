@@ -27,6 +27,15 @@ class RedisBuilder extends Builder
 
     protected ?RedisRepository $repositoryInstance = null;
 
+    /**
+     * Flag to prevent infinite recursion between find() and first().
+     *
+     * When find() falls back to parent::find(), which internally calls $this->first(),
+     * this flag ensures first() delegates to parent::first() (pure SQL) instead of
+     * re-entering the Redis path and calling find() again.
+     */
+    protected bool $dbFallback = false;
+
     /** @var Builder<Model>|null */
     protected ?Builder $wrappedBuilder = null;
 
@@ -127,14 +136,26 @@ class RedisBuilder extends Builder
             $cached = $this->repository()->get($key);
 
             if ($cached !== null) {
-                $result = $this->hydrateModel($cached);
+                $hydrated = $this->hydrateModel($cached);
+
+                if ($this->modelSatisfiesWheres($hydrated)) {
+                    $result = $hydrated;
+                }
             }
         } catch (Exception) {
             // Redis unavailable — fallback to DB
         }
 
         if ($result === null) {
-            $result = parent::find($id, $columns);
+            // Set flag to prevent find→parent::find→first→find infinite loop.
+            // parent::find() calls $this->first() which is overridden; the flag
+            // ensures it falls through to parent::first() (pure SQL).
+            $this->dbFallback = true;
+            try {
+                $result = parent::find($id, $columns);
+            } finally {
+                $this->dbFallback = false;
+            }
 
             if ($result instanceof Model) {
                 try {
@@ -194,7 +215,12 @@ class RedisBuilder extends Builder
             foreach ($cached as $redisKey => $attrs) {
                 $originalId = $keyToId[$redisKey];
                 if ($attrs !== null) {
-                    $found[$originalId] = $this->hydrateModel($attrs);
+                    $hydrated = $this->hydrateModel($attrs);
+                    if ($this->modelSatisfiesWheres($hydrated)) {
+                        $found[$originalId] = $hydrated;
+                    }
+                    // If wheres not satisfied, skip — DB fallback below will apply
+                    // the correct constraints via whereIn + existing query scopes.
                 } else {
                     $missedIds[] = $originalId;
                 }
@@ -245,6 +271,10 @@ class RedisBuilder extends Builder
      */
     public function first($columns = ['*']): ?Model
     {
+        if ($this->dbFallback) {
+            return parent::first($columns);
+        }
+
         $indexKey = $this->getRelationIndexKey();
 
         if ($indexKey === null) {
@@ -764,6 +794,73 @@ class RedisBuilder extends Builder
                     }
                     $model->setRelation($directRelation, $dbRelated);
                 }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if a hydrated model satisfies all where clauses on the current query.
+     * Handles relation FK constraints (Basic =) and SoftDeletes (Null on deleted_at).
+     * Returns false for unsupported where types to trigger safe DB fallback.
+     */
+    protected function modelSatisfiesWheres(Model $model): bool
+    {
+        // Apply global scopes (e.g. SoftDeletes' whereNull) to get the full set
+        // of constraints. applyScopes() returns a clone, so the original builder
+        // is not mutated.
+        /** @var list<array<string, mixed>> $wheres */
+        $wheres = $this->applyScopes()->getQuery()->wheres;
+
+        if (empty($wheres)) {
+            return true;
+        }
+
+        foreach ($wheres as $where) {
+            /** @var string|null $column */
+            $column = $where['column'] ?? null;
+
+            if ($column !== null && str_contains($column, '.')) {
+                $column = substr($column, strrpos($column, '.') + 1);
+            }
+
+            $type = $where['type'] ?? null;
+
+            if ($column === null) {
+                // No column — unsupported where, fall back to DB
+                return false;
+            }
+
+            if ($type === 'Basic') {
+                $modelValue = $model->getAttribute($column);
+                $operator = $where['operator'] ?? '=';
+                $expected = $where['value'];
+
+                $passes = match ($operator) {
+                    '=', '==' => $modelValue == $expected,
+                    '!=', '<>' => $modelValue != $expected,
+                    '>' => $modelValue > $expected,
+                    '<' => $modelValue < $expected,
+                    '>=' => $modelValue >= $expected,
+                    '<=' => $modelValue <= $expected,
+                    default => false,
+                };
+
+                if (!$passes) {
+                    return false;
+                }
+            } elseif ($type === 'Null') {
+                if ($model->getAttribute($column) !== null) {
+                    return false;
+                }
+            } elseif ($type === 'NotNull') {
+                if ($model->getAttribute($column) === null) {
+                    return false;
+                }
+            } else {
+                // Unsupported where type — fall back to DB for safety
+                return false;
             }
         }
 
