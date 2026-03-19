@@ -301,3 +301,87 @@ it('updated не трогает индексы (связь не меняется
     expect($this->repository->getRelationIds("project:{$project->id}:tags"))
         ->toContain((string) $tag->id);
 });
+
+// ─── synced: обновление уже привязанного pivot ───────────────
+
+it('synced обновляет pivot-запись для уже прикреплённого ID', function () {
+    $project = Project::create(['name' => 'Test']);
+    $tag = Tag::create(['name' => 'Tag']);
+
+    // Tag already attached with old pivot
+    $this->repository->addToIndex("project:{$project->id}:tags", $tag->id, time());
+    $this->repository->set("project_tag:{$project->id}:{$tag->id}", [
+        'project_id' => $project->id,
+        'tag_id'     => $tag->id,
+        'role'       => 'old',
+    ]);
+
+    // Sync: no new attach, no detach, but pivot for tag was updated
+    $event = new RedisPivotChanged(
+        $project,
+        'tags',
+        'synced',
+        [$tag->id],                          // allIds = updated
+        [$tag->id => ['role' => 'updated']], // pivotAttributes with updated ID
+    );
+    $this->listener->handle($event);
+
+    $pivotData = $this->repository->get("project_tag:{$project->id}:{$tag->id}");
+
+    expect($pivotData['role'])->toBe('updated');
+    // Index must still be intact
+    expect($this->repository->getRelationIds("project:{$project->id}:tags"))
+        ->toContain((string) $tag->id);
+});
+
+it('synced сохраняет существующие поля pivot при обновлении (merge, не перезапись)', function () {
+    $project = Project::create(['name' => 'Test']);
+    $tag = Tag::create(['name' => 'Tag']);
+
+    // Tag already attached with pivot that has created_at and role
+    $this->repository->addToIndex("project:{$project->id}:tags", $tag->id, time());
+    $this->repository->set("project_tag:{$project->id}:{$tag->id}", [
+        'project_id' => $project->id,
+        'tag_id'     => $tag->id,
+        'role'       => 'old',
+        'created_at' => '2025-01-01 00:00:00',
+    ]);
+
+    // Sync updates only role — created_at must survive
+    $event = new RedisPivotChanged(
+        $project,
+        'tags',
+        'synced',
+        [$tag->id],
+        [$tag->id => ['role' => 'new']],
+    );
+    $this->listener->handle($event);
+
+    $pivotData = $this->repository->get("project_tag:{$project->id}:{$tag->id}");
+
+    expect($pivotData)->not->toBeNull();
+    expect($pivotData['role'])->toBe('new');
+    expect($pivotData['created_at'])->toBe('2025-01-01 00:00:00');
+    expect($pivotData['project_id'])->toBe($project->id);
+    expect($pivotData['tag_id'])->toBe($tag->id);
+});
+
+// ─── Resilience: Redis недоступен ───────────────────────────
+
+it('handle не бросает exception когда Redis недоступен', function () {
+    $project = Project::create(['name' => 'Test']);
+    $tag     = Tag::create(['name' => 'Tag']);
+
+    $broken = new \Illuminate\Redis\RedisManager(app(), 'phpredis', [
+        'default' => ['host' => 'localhost', 'port' => 63790, 'database' => 15, 'read_write_timeout' => 1],
+    ]);
+    app()->instance('redis', $broken);
+    \Illuminate\Support\Facades\Redis::clearResolvedInstances();
+
+    $brokenListener = new \PetkaKahin\EloquentRedisMirror\Listeners\SyncRedisPivot(
+        new \PetkaKahin\EloquentRedisMirror\Repository\RedisRepository()
+    );
+
+    $event = new RedisPivotChanged($project, 'tags', 'attached', [$tag->id], [$tag->id => []]);
+    $brokenListener->handle($event);
+})->throwsNoExceptions();

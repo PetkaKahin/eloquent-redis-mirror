@@ -5,10 +5,13 @@ namespace PetkaKahin\EloquentRedisMirror\Traits;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Str;
 use PetkaKahin\EloquentRedisMirror\Builder\RedisBuilder;
 use PetkaKahin\EloquentRedisMirror\Events\RedisModelChanged;
 use PetkaKahin\EloquentRedisMirror\Relations\RedisBelongsToMany;
+use RuntimeException;
 
 /**
  * @phpstan-require-extends Model
@@ -19,22 +22,22 @@ trait HasRedisCache
 {
     public static function bootHasRedisCache(): void
     {
-        static::created(function (Model $model): void {
+        static::created(static function (Model $model): void {
             event(new RedisModelChanged($model, 'created'));
         });
 
-        static::updated(function (Model $model): void {
+        static::updated(static function (Model $model): void {
             /** @var array<int, string> $dirty */
-            $dirty = array_keys($model->getChanges());
+            $dirty           = array_keys($model->getChanges());
             $updatedAtColumn = $model->getUpdatedAtColumn();
-            $dirty = array_values(array_diff($dirty, [$updatedAtColumn]));
+            $dirty           = array_values(array_diff($dirty, [$updatedAtColumn]));
 
             if (!empty($dirty)) {
                 event(new RedisModelChanged($model, 'updated', $dirty));
             }
         });
 
-        static::deleted(function (Model $model): void {
+        static::deleted(static function (Model $model): void {
             event(new RedisModelChanged($model, 'deleted'));
         });
     }
@@ -55,7 +58,7 @@ trait HasRedisCache
         $key = $this->getKey();
 
         if ($key === null) {
-            throw new \RuntimeException('Cannot generate Redis key for model without primary key value.');
+            throw new RuntimeException('Cannot generate Redis key for model without primary key value.');
         }
 
         return static::getRedisPrefix() . ':' . $key;
@@ -76,7 +79,7 @@ trait HasRedisCache
     }
 
     /**
-     * @param \Illuminate\Database\Query\Builder $query
+     * @param QueryBuilder $query
      */
     public function newEloquentBuilder($query): RedisBuilder
     {
@@ -89,14 +92,7 @@ trait HasRedisCache
     public function hasMany($related, $foreignKey = null, $localKey = null): HasMany
     {
         $relation = parent::hasMany($related, $foreignKey, $localKey);
-
-        $builder = $relation->getQuery();
-        if ($builder instanceof RedisBuilder) {
-            $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? null;
-            if ($caller !== null && in_array($caller, $this->getRedisRelations(), true)) {
-                $builder->setRelationContext($this, $caller);
-            }
-        }
+        $this->applyRedisRelationContext($relation);
 
         return $relation;
     }
@@ -107,16 +103,36 @@ trait HasRedisCache
     public function hasOne($related, $foreignKey = null, $localKey = null): HasOne
     {
         $relation = parent::hasOne($related, $foreignKey, $localKey);
-
-        $builder = $relation->getQuery();
-        if ($builder instanceof RedisBuilder) {
-            $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? null;
-            if ($caller !== null && in_array($caller, $this->getRedisRelations(), true)) {
-                $builder->setRelationContext($this, $caller);
-            }
-        }
+        $this->applyRedisRelationContext($relation);
 
         return $relation;
+    }
+
+    /**
+     * Set Redis relation context on the builder if the calling method is a registered Redis relation.
+     * Reads frame [2] from the backtrace: [0]=this, [1]=hasMany/hasOne, [2]=actual relation method.
+     *
+     * @param Relation<Model, Model, mixed> $relation
+     */
+    private function applyRedisRelationContext(Relation $relation): void
+    {
+        $builder = $relation->getQuery();
+
+        if (!$builder instanceof RedisBuilder) {
+            return;
+        }
+
+        $redisRelations = $this->getRedisRelations();
+
+        if (empty($redisRelations)) {
+            return;
+        }
+
+        $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3)[2]['function'] ?? null;
+
+        if ($caller !== null && in_array($caller, $redisRelations, true)) {
+            $builder->setRelationContext($this, $caller);
+        }
     }
 
     /**

@@ -79,6 +79,22 @@ it('update без изменений не кидает event', function () {
     Event::assertNotDispatched(RedisModelChanged::class);
 });
 
+it('update НЕ пишет в Redis напрямую', function () {
+    $project = Project::create(['name' => 'Old']);
+    // At this point, the created listener has written 'Old' to Redis
+
+    Event::fake([RedisModelChanged::class]);
+
+    $project->update(['name' => 'New']);
+
+    $repository = app(RedisRepository::class);
+    // Redis value must still be 'Old': Builder didn't update Redis,
+    // only the faked-out listener would have done that.
+    $cached = $repository->get("project:{$project->id}");
+    expect($cached)->not->toBeNull();
+    expect($cached['name'])->toBe('Old');
+});
+
 // ─── delete() ───────────────────────────────────────────────
 
 it('delete удаляет из Postgres и кидает event', function () {
@@ -94,4 +110,20 @@ it('delete удаляет из Postgres и кидает event', function () {
     Event::assertDispatched(RedisModelChanged::class, function ($event) {
         return $event->action === 'deleted';
     });
+});
+
+it('delete НЕ пишет в Redis напрямую', function () {
+    $project = Project::create(['name' => 'Test']);
+    $projectId = $project->id;
+
+    // Pre-populate Redis so we can verify it was NOT cleared by the Builder
+    $repository = app(RedisRepository::class);
+    $repository->set("project:{$projectId}", $project->getAttributes());
+
+    Event::fake([RedisModelChanged::class]);
+
+    $project->delete();
+
+    // Redis entry must still be there — Builder should NOT touch Redis on delete
+    expect($repository->get("project:{$projectId}"))->not->toBeNull();
 });

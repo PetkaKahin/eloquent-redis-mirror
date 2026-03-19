@@ -2,6 +2,7 @@
 
 namespace PetkaKahin\EloquentRedisMirror\Relations;
 
+use Illuminate\Contracts\Support\Arrayable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use PetkaKahin\EloquentRedisMirror\Events\RedisPivotChanged;
@@ -51,7 +52,7 @@ class RedisBelongsToMany extends BelongsToMany
             $detachIds = $this->allRelatedIds()->toArray();
         } else {
             /** @var list<int|string> $detachIds */
-            $detachIds = array_values((array) $ids);
+            $detachIds = $this->extractIds($ids);
         }
 
         $result = parent::detach($ids, $touch);
@@ -67,10 +68,10 @@ class RedisBelongsToMany extends BelongsToMany
     }
 
     /**
-     * @param \Illuminate\Contracts\Support\Arrayable<array-key, mixed>|array<array-key, mixed> $ids
+     * @param Arrayable<array-key, mixed>|array<array-key, mixed> $ids
      * @return array{attached: list<mixed>, detached: list<mixed>, updated: list<mixed>}
      */
-    public function sync($ids, $detaching = true)
+    public function sync($ids, $detaching = true): array
     {
         $result = parent::sync($ids, $detaching);
 
@@ -78,20 +79,21 @@ class RedisBelongsToMany extends BelongsToMany
         $attached = array_values($result['attached']);
         /** @var list<int|string> $detached */
         $detached = array_values($result['detached']);
+        /** @var list<int|string> $updated */
+        $updated = array_values($result['updated']);
 
+        // allIds = attached + detached + updated (updated pivot must also be synced to Redis)
         /** @var list<int|string> $allIds */
-        $allIds = array_merge($attached, $detached);
+        $allIds = array_merge($attached, $detached, $updated);
 
         /** @var array<int|string, array<string, mixed>> $pivotAttributes */
         $pivotAttributes = [];
-        // For newly attached IDs, extract pivot attributes from the input
-        if (is_array($ids)) {
-            foreach ($attached as $attachedId) {
-                if (isset($ids[$attachedId]) && is_array($ids[$attachedId])) {
-                    $pivotAttributes[$attachedId] = $ids[$attachedId];
-                } else {
-                    $pivotAttributes[$attachedId] = [];
-                }
+        // For attached and updated IDs, extract pivot attributes from the input
+        foreach (array_merge($attached, $updated) as $id) {
+            if (is_array($ids) && isset($ids[$id]) && is_array($ids[$id])) {
+                $pivotAttributes[$id] = $ids[$id];
+            } else {
+                $pivotAttributes[$id] = [];
             }
         }
 
@@ -107,10 +109,10 @@ class RedisBelongsToMany extends BelongsToMany
     }
 
     /**
-     * @param \Illuminate\Contracts\Support\Arrayable<array-key, mixed>|array<array-key, mixed> $ids
+     * @param Arrayable<array-key, mixed>|array<array-key, mixed> $ids
      * @return array{attached: list<mixed>, detached: list<mixed>}
      */
-    public function toggle($ids, $touch = true)
+    public function toggle($ids, $touch = true): array
     {
         $result = parent::toggle($ids, $touch);
 

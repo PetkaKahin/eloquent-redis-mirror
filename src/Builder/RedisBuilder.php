@@ -2,22 +2,30 @@
 
 namespace PetkaKahin\EloquentRedisMirror\Builder;
 
-use DateTimeInterface;
+use Exception;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\DB;
+use PetkaKahin\EloquentRedisMirror\Concerns\ResolvesRedisRelations;
 use PetkaKahin\EloquentRedisMirror\Contracts\HasRedisCacheInterface;
 use PetkaKahin\EloquentRedisMirror\Repository\RedisRepository;
-use PetkaKahin\EloquentRedisMirror\Traits\HasRedisCache;
 
 /**
  * @extends Builder<Model>
  */
 class RedisBuilder extends Builder
 {
+    use ResolvesRedisRelations;
+
     protected ?Model $relationParent = null;
     protected ?string $relationName = null;
+
+    protected ?RedisRepository $repositoryInstance = null;
 
     /**
      * @param Model&HasRedisCacheInterface $parent
@@ -33,7 +41,7 @@ class RedisBuilder extends Builder
     protected function hasRelationContext(): bool
     {
         return $this->relationParent !== null
-            && $this->modelUsesRedis($this->relationParent)
+            && $this->usesRedisCache($this->relationParent)
             && $this->relationName !== null;
     }
 
@@ -54,26 +62,24 @@ class RedisBuilder extends Builder
 
     protected function repository(): RedisRepository
     {
-        return app(RedisRepository::class);
-    }
+        if ($this->repositoryInstance === null) {
+            $this->repositoryInstance = app(RedisRepository::class);
+        }
 
-    protected function modelUsesRedis(?Model $model = null): bool
-    {
-        $model = $model ?? $this->getModel();
-        return in_array(HasRedisCache::class, class_uses_recursive($model));
+        return $this->repositoryInstance;
     }
 
     /**
      * @param mixed $id
      * @param list<string> $columns
      */
-    public function find($id, $columns = ['*']): Model|\Illuminate\Database\Eloquent\Collection|null
+    public function find($id, $columns = ['*']): Model|Collection|null
     {
         if (is_array($id)) {
             return $this->findMany(array_values($id), $columns);
         }
 
-        if (!$this->modelUsesRedis()) {
+        if (!$this->usesRedisCache($this->getModel())) {
             return parent::find($id, $columns);
         }
 
@@ -90,7 +96,7 @@ class RedisBuilder extends Builder
             if ($cached !== null) {
                 $result = $this->hydrateModel($cached);
             }
-        } catch (\Exception) {
+        } catch (Exception) {
             // Redis unavailable — fallback to DB
         }
 
@@ -100,7 +106,7 @@ class RedisBuilder extends Builder
             if ($result instanceof Model) {
                 try {
                     $this->repository()->set($key, $result->getAttributes());
-                } catch (\Exception) {
+                } catch (Exception) {
                     // Redis unavailable — skip caching
                 }
             }
@@ -117,15 +123,15 @@ class RedisBuilder extends Builder
     /**
      * @param array<int, mixed> $ids
      * @param list<string> $columns
-     * @return \Illuminate\Database\Eloquent\Collection<int, Model>
+     * @return Collection<int, Model>
      */
-    public function findMany($ids, $columns = ['*'])
+    public function findMany($ids, $columns = ['*']): Collection
     {
         if (empty($ids)) {
             return $this->getModel()->newCollection();
         }
 
-        if (!$this->modelUsesRedis()) {
+        if (!$this->usesRedisCache($this->getModel())) {
             return parent::findMany($ids, $columns);
         }
 
@@ -160,7 +166,7 @@ class RedisBuilder extends Builder
                     $missedIds[] = $originalId;
                 }
             }
-        } catch (\Exception) {
+        } catch (Exception) {
             /** @var list<int|string> $missedIds */
             $missedIds = array_values($ids);
         }
@@ -180,7 +186,7 @@ class RedisBuilder extends Builder
             if (!empty($toCache)) {
                 try {
                     $this->repository()->setMany($toCache);
-                } catch (\Exception) {
+                } catch (Exception) {
                     // Redis unavailable
                 }
             }
@@ -209,14 +215,18 @@ class RedisBuilder extends Builder
         }
 
         try {
-            $ids = $this->repository()->getRelationIds($indexKey, 0, 0);
+            $ids = $this->repository()->getRelationIdsChecked($indexKey, 0, 0);
+
+            if ($ids === null) {
+                return parent::first($columns);
+            }
 
             if (empty($ids)) {
                 return null;
             }
 
-            return $this->find((int) $ids[0], $columns);
-        } catch (\Exception) {
+            return $this->find($ids[0], $columns);
+        } catch (Exception) {
             return parent::first($columns);
         }
     }
@@ -241,7 +251,11 @@ class RedisBuilder extends Builder
         $page = $page ?: LengthAwarePaginator::resolveCurrentPage($pageName);
 
         try {
-            $total = $this->repository()->getRelationCount($indexKey);
+            $total = $this->repository()->getRelationCountChecked($indexKey);
+
+            if ($total === null) {
+                return parent::paginate($perPage, $columns, $pageName, $page);
+            }
 
             if ($total === 0) {
                 return new LengthAwarePaginator([], 0, $perPage, $page, [
@@ -252,14 +266,13 @@ class RedisBuilder extends Builder
 
             $offset = ($page - 1) * $perPage;
             $ids = $this->repository()->getRelationIds($indexKey, $offset, $offset + $perPage - 1);
-            $intIds = array_map('intval', $ids);
-            $items = $this->findMany($intIds, $columns);
+            $items = $this->findMany($ids, $columns);
 
             return new LengthAwarePaginator($items, $total, $perPage, $page, [
                 'path' => LengthAwarePaginator::resolveCurrentPath(),
                 'pageName' => $pageName,
             ]);
-        } catch (\Exception) {
+        } catch (Exception) {
             return parent::paginate($perPage, $columns, $pageName, $page);
         }
     }
@@ -268,19 +281,22 @@ class RedisBuilder extends Builder
      * @param array<int, Model> $models
      * @return array<int, Model>
      */
-    public function eagerLoadRelations(array $models)
+    public function eagerLoadRelations(array $models): array
     {
+        $nonRedisEagerLoad = $this->eagerLoad;
+
         foreach ($this->eagerLoad as $name => $constraints) {
-            if (!is_callable($constraints)) {
-                continue;
-            }
+            /** @var callable $constraints */
             if ($this->loadRedisRelation($models, $name, $constraints)) {
-                unset($this->eagerLoad[$name]);
+                unset($nonRedisEagerLoad[$name]);
             }
         }
 
-        if (!empty($this->eagerLoad)) {
+        if (!empty($nonRedisEagerLoad)) {
+            $original = $this->eagerLoad;
+            $this->eagerLoad = $nonRedisEagerLoad;
             $models = parent::eagerLoadRelations($models);
+            $this->eagerLoad = $original;
         }
 
         return $models;
@@ -305,11 +321,11 @@ class RedisBuilder extends Builder
             return false;
         }
 
-        /** @var \Illuminate\Database\Eloquent\Relations\Relation<Model, Model, mixed> $relation */
+        /** @var Relation<Model, Model, mixed> $relation */
         $relation = $firstModel->$directRelation();
         $relatedModel = $relation->getRelated();
 
-        if (!$this->modelUsesRedis($relatedModel)) {
+        if (!$this->usesRedisCache($relatedModel)) {
             return false;
         }
 
@@ -324,7 +340,7 @@ class RedisBuilder extends Builder
         /** @var array<int, Model&HasRedisCacheInterface> $redisModels */
         $redisModels = [];
         foreach ($models as $i => $model) {
-            if (!$this->modelUsesRedis($model)) {
+            if (!$this->usesRedisCache($model)) {
                 continue;
             }
             /** @var Model&HasRedisCacheInterface $model */
@@ -340,15 +356,20 @@ class RedisBuilder extends Builder
         try {
             /** @var array<string, true> $allRelatedIds */
             $allRelatedIds = [];
-            /** @var array<int, list<string>> $modelRelatedIds */
+            /** @var array<int, list<string>|null> $modelRelatedIds */
             $modelRelatedIds = [];
 
+            // Fetch all relation-index IDs in a single pipeline instead of N roundtrips
+            $batchIds = $repository->getManyRelationIds(array_values($modelIndexKeys));
+
             foreach ($modelIndexKeys as $i => $indexKey) {
-                $relatedIds = $repository->getRelationIds($indexKey);
+                $relatedIds = $batchIds[$indexKey] ?? null;
                 $modelRelatedIds[$i] = $relatedIds;
 
-                foreach ($relatedIds as $relId) {
-                    $allRelatedIds[$relId] = true;
+                if ($relatedIds !== null) {
+                    foreach ($relatedIds as $relId) {
+                        $allRelatedIds[$relId] = true;
+                    }
                 }
             }
 
@@ -358,9 +379,11 @@ class RedisBuilder extends Builder
             $warmModels = [];
 
             foreach ($modelRelatedIds as $i => $relatedIds) {
-                if (empty($relatedIds)) {
+                if ($relatedIds === null) {
+                    // null → index was never warmed, needs cold-start
                     $coldStartModels[$i] = $redisModels[$i];
                 } else {
+                    // [] or [id,...] → index is warmed (possibly empty)
                     $warmModels[$i] = $relatedIds;
                 }
             }
@@ -405,7 +428,7 @@ class RedisBuilder extends Builder
                     if (!empty($toCache)) {
                         try {
                             $repository->setMany($toCache);
-                        } catch (\Exception) {
+                        } catch (Exception) {
                             // Redis unavailable
                         }
                     }
@@ -442,7 +465,7 @@ class RedisBuilder extends Builder
                                 $allPivotData[$pivotKeyMap[$pKey]] = $pData;
                             }
                         }
-                    } catch (\Exception) {
+                    } catch (Exception) {
                         // Redis unavailable — pivot data will be empty
                     }
                 }
@@ -486,62 +509,210 @@ class RedisBuilder extends Builder
                 $models[$i]->setRelation($directRelation, $collection);
             }
 
-            foreach ($coldStartModels as $i => $coldModel) {
-                /** @var \Illuminate\Database\Eloquent\Collection<int, Model> $dbRelated */
-                $dbRelated = $coldModel->$directRelation()->get();
+            // ── Cold-start: single batch query instead of N individual queries ──
+            if (!empty($coldStartModels)) {
+                // Track all cold-start index keys so we can mark them as warmed after DB load
+                /** @var list<string> $coldModelIndexKeys */
+                $coldModelIndexKeys = array_values(array_map(
+                    static fn (int $i): string => $modelIndexKeys[$i],
+                    array_keys($coldStartModels),
+                ));
 
-                if ($dbRelated->isNotEmpty()) {
-                    foreach ($dbRelated as $rel) {
-                        $relKey = $relatedPrefix . ':' . $rel->getKey();
-                        try {
-                            $repository->set($relKey, $rel->getAttributes());
-                            /** @var DateTimeInterface|null $createdAt */
-                            $createdAt = $rel->getAttribute('created_at');
-                            $score = $createdAt instanceof DateTimeInterface ? (float) $createdAt->getTimestamp() : (float) time();
-                            $repository->addToIndex($modelIndexKeys[$i], (string) $rel->getKey(), $score);
+                /** @var array<string, array<string, mixed>> $coldToCache */
+                $coldToCache = [];
+                /** @var array<string, array<int|string, float>> $coldIndexEntries */
+                $coldIndexEntries = [];
+                /** @var array<string, array<string, mixed>> $coldPivotToCache */
+                $coldPivotToCache = [];
 
-                            // Cache pivot data during cold start for BelongsToMany
-                            if ($isBelongsToMany) {
-                                /** @var BelongsToMany<Model, Model> $btmRelation */
-                                $btmRelation = $relation;
-                                $pivotTable = $btmRelation->getTable();
-                                $parentId = $coldModel->getKey();
+                if ($isBelongsToMany) {
+                    /** @var BelongsToMany<Model, Model> $btmRelation */
+                    $btmRelation     = $relation;
+                    $foreignPivotKey = $btmRelation->getForeignPivotKeyName();
+                    $relatedPivotKey = $btmRelation->getRelatedPivotKeyName();
 
-                                if ($rel->relationLoaded('pivot')) {
-                                    /** @var Model $pivotModel */
-                                    $pivotModel = $rel->getRelation('pivot');
-                                    /** @var array<string, mixed> $pivotData */
-                                    $pivotData = $pivotModel->getAttributes();
-                                    $pivotKey = $pivotTable . ':' . $parentId . ':' . $rel->getKey();
-                                    $repository->set($pivotKey, $pivotData);
-                                }
+                    $coldParentIds = array_values(array_map(
+                        static fn (Model $m): mixed => $m->getKey(),
+                        $coldStartModels,
+                    ));
+
+                    // One pivot-table query for all cold parents
+                    $allPivotRows     = DB::table($pivotTable)->whereIn($foreignPivotKey, $coldParentIds)->get();
+                    $uniqueRelatedIds = $allPivotRows->pluck($relatedPivotKey)->unique()->values()->all();
+
+                    $coldRelatedByPk = empty($uniqueRelatedIds)
+                        ? $relatedModel->newCollection()
+                        : $relatedModel->newQuery()->whereIn($relatedModel->getKeyName(), $uniqueRelatedIds)->get();
+
+                    /** @var \Illuminate\Support\Collection<int|string, \Illuminate\Support\Collection<int, mixed>> $pivotByParent */
+                    $pivotByParent = $allPivotRows->groupBy($foreignPivotKey);
+                    $coldRelatedByPk = $coldRelatedByPk->keyBy($relatedModel->getKeyName());
+
+                    foreach ($coldStartModels as $i => $coldModel) {
+                        $parentId  = $coldModel->getKey();
+                        $pivotRows = $pivotByParent->get((string) $parentId) ?? collect();
+
+                        /** @var list<Model> $orderedRelated */
+                        $orderedRelated = [];
+
+                        foreach ($pivotRows as $pivotRow) {
+                            $relId    = $pivotRow->{$relatedPivotKey};
+                            $relModel = $coldRelatedByPk[$relId] ?? null;
+
+                            if ($relModel === null) {
+                                continue;
                             }
-                        } catch (\Exception) {
-                            // Redis unavailable
+
+                            /** @var array<string, mixed> $pivotData */
+                            $pivotData = (array) $pivotRow;
+                            $relModel  = clone $relModel;
+                            $relModel->setRelation('pivot', $btmRelation->newExistingPivot($pivotData));
+                            $orderedRelated[] = $relModel;
+
+                            $coldToCache[$relatedPrefix . ':' . $relId]                      = $relModel->getAttributes();
+                            $coldIndexEntries[$modelIndexKeys[$i]][(string) $relId]          = $this->scoreFromModel($relModel);
+                            $coldPivotToCache[$pivotTable . ':' . $parentId . ':' . $relId] = $pivotData;
+                        }
+
+                        $dbRelated = $relatedModel->newCollection($orderedRelated);
+
+                        if ($nested !== null) {
+                            $relatedArray = $dbRelated->all();
+                            $this->loadRedisRelation($relatedArray, $nested, $constraints);
+                            $dbRelated = $relatedModel->newCollection($relatedArray);
+                        }
+
+                        $models[$i]->setRelation($directRelation, $dbRelated);
+                    }
+                } else {
+                    // HasMany / HasOne: batch via single whereIn on the foreign key
+                    /** @var HasOneOrMany<Model, Model, mixed> $hasManyRelation */
+                    $hasManyRelation = $relation;
+                    $fkName          = $hasManyRelation->getForeignKeyName();
+                    $localKeyName    = $hasManyRelation->getLocalKeyName();
+
+                    /** @var array<int, mixed> $coldLocalKeys */
+                    $coldLocalKeys = [];
+                    foreach ($coldStartModels as $i => $coldModel) {
+                        $coldLocalKeys[$i] = $coldModel->getAttribute($localKeyName);
+                    }
+
+                    $allColdRelated = $relatedModel->newQuery()
+                        ->whereIn($fkName, array_values($coldLocalKeys))
+                        ->get();
+
+                    $grouped = $allColdRelated->groupBy($fkName);
+
+                    foreach ($coldStartModels as $i => $coldModel) {
+                        /** @var int|string $localKeyValue */
+                        $localKeyValue = $coldLocalKeys[$i];
+                        /** @var array<int, Model> $groupedModels */
+                        $groupedModels = ($grouped->get($localKeyValue) ?? collect())->all();
+                        $dbRelated     = $relatedModel->newCollection($groupedModels);
+
+                        foreach ($dbRelated as $rel) {
+                            $coldToCache[$relatedPrefix . ':' . $rel->getKey()]             = $rel->getAttributes();
+                            $coldIndexEntries[$modelIndexKeys[$i]][(string) $rel->getKey()] = $this->scoreFromModel($rel);
+                        }
+
+                        if ($nested !== null) {
+                            $relatedArray = $dbRelated->all();
+                            $this->loadRedisRelation($relatedArray, $nested, $constraints);
+                            $dbRelated = $relatedModel->newCollection($relatedArray);
+                        }
+
+                        $models[$i]->setRelation($directRelation, $dbRelated);
+                    }
+                }
+
+                // Batch-write all cold-start data to Redis in a single pipeline (best-effort)
+                try {
+                    $repository->executeBatch(
+                        setItems: array_replace($coldToCache, $coldPivotToCache),
+                        addToIndices: $coldIndexEntries,
+                        markWarmed: $coldModelIndexKeys,
+                    );
+                } catch (Exception) {
+                    // Redis unavailable — relations already set from DB, caching is best-effort
+                }
+            }
+        } catch (Exception) {
+            // Redis unavailable — fall back to a single batch DB query per relation type
+            if ($isBelongsToMany) {
+                /** @var BelongsToMany<Model, Model> $btmRelation */
+                $btmRelation     = $relation;
+                $pivotTable      = $btmRelation->getTable();
+                $foreignPivotKey = $btmRelation->getForeignPivotKeyName();
+                $relatedPivotKey = $btmRelation->getRelatedPivotKeyName();
+
+                $parentIds = array_values(array_map(static fn (Model $m): mixed => $m->getKey(), $models));
+
+                $allPivotRows     = DB::table($pivotTable)->whereIn($foreignPivotKey, $parentIds)->get();
+                $uniqueRelatedIds = $allPivotRows->pluck($relatedPivotKey)->unique()->values()->all();
+
+                $fallbackRelated = empty($uniqueRelatedIds)
+                    ? $relatedModel->newCollection()
+                    : $relatedModel->newQuery()->whereIn($relatedModel->getKeyName(), $uniqueRelatedIds)->get();
+                $fallbackRelated = $fallbackRelated->keyBy($relatedModel->getKeyName());
+
+                $pivotByParent = $allPivotRows->groupBy($foreignPivotKey);
+
+                foreach ($models as $model) {
+                    $parentId  = $model->getKey();
+                    $pivotRows = $pivotByParent->get((string) $parentId) ?? collect();
+
+                    /** @var list<Model> $orderedRelated */
+                    $orderedRelated = [];
+                    foreach ($pivotRows as $pivotRow) {
+                        $relId    = $pivotRow->{$relatedPivotKey};
+                        $relModel = $fallbackRelated[$relId] ?? null;
+                        if ($relModel !== null) {
+                            $relModel = clone $relModel;
+                            $relModel->setRelation('pivot', $btmRelation->newExistingPivot((array) $pivotRow));
+                            $orderedRelated[] = $relModel;
                         }
                     }
 
+                    $dbRelated = $relatedModel->newCollection($orderedRelated);
                     if ($nested !== null) {
-                        $relatedArray = $dbRelated->all();
-                        $this->loadRedisRelation($relatedArray, $nested, $constraints);
-                        $dbRelated = $relatedModel->newCollection($relatedArray);
+                        $dbRelated->load($nested);
                     }
-
-                    $models[$i]->setRelation($directRelation, $dbRelated);
-                } else {
-                    $models[$i]->setRelation($directRelation, $relatedModel->newCollection());
+                    $model->setRelation($directRelation, $dbRelated);
                 }
-            }
-        } catch (\Exception) {
-            foreach ($models as $model) {
-                /** @var \Illuminate\Database\Eloquent\Collection<int, Model> $dbRelated */
-                $dbRelated = $model->$directRelation()->get();
+            } elseif ($relation instanceof HasOneOrMany) {
+                /** @var HasOneOrMany<Model, Model, mixed> $hasManyRelation */
+                $hasManyRelation = $relation;
+                $fkName          = $hasManyRelation->getForeignKeyName();
+                $localKeyName    = $hasManyRelation->getLocalKeyName();
 
-                if ($nested !== null) {
-                    $dbRelated->load($nested);
+                $localKeys = array_values(array_map(
+                    static fn (Model $m): mixed => $m->getAttribute($localKeyName),
+                    $models,
+                ));
+
+                $allFallbackRelated = $relatedModel->newQuery()->whereIn($fkName, $localKeys)->get();
+                $grouped            = $allFallbackRelated->groupBy($fkName);
+
+                foreach ($models as $model) {
+                    /** @var int|string $localKey */
+                    $localKey  = $model->getAttribute($localKeyName);
+                    /** @var array<int, Model> $groupedModels */
+                    $groupedModels = ($grouped->get($localKey) ?? collect())->all();
+                    $dbRelated = $relatedModel->newCollection($groupedModels);
+                    if ($nested !== null) {
+                        $dbRelated->load($nested);
+                    }
+                    $model->setRelation($directRelation, $dbRelated);
                 }
-
-                $model->setRelation($directRelation, $dbRelated);
+            } else {
+                foreach ($models as $model) {
+                    /** @var Collection<int, Model> $dbRelated */
+                    $dbRelated = $model->$directRelation()->get();
+                    if ($nested !== null) {
+                        $dbRelated->load($nested);
+                    }
+                    $model->setRelation($directRelation, $dbRelated);
+                }
             }
         }
 

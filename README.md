@@ -23,42 +23,41 @@ $project->categories()->paginate(15);
 
 ```
                           Ваш код
-                   ┌─────────────────────┐
-                   │  Project::find(7)   │
-                   │  $project->update() │
-                   └────────┬────────────┘
-                            │
-                   ┌────────▼────────────┐
-                   │    RedisBuilder     │  Подменяет стандартный Eloquent Builder
-                   └────────┬────────────┘
-                            │
-             ┌──── READ ────┴──── WRITE ────┐
-             │                              │
-             ▼                              ▼
+            ┌──── READ ──────────────── WRITE ────────────────┐
+            │  Project::find(7)         $project->update()    │
+            │  Project::with(...).find  $project->delete()    │
+            │  $project->categories()   tags()->attach(...)   │
+            └────────┬──────────────────────────┬─────────────┘
+                     │                          │
+            ┌────────▼────────────┐    ┌────────▼────────────┐
+            │    RedisBuilder     │    │  Eloquent + model   │
+            │  find/findMany/with │    │  lifecycle hooks    │
+            │  first / paginate   │    │  (bootHasRedisCache)│
+            └────────┬────────────┘    └────────┬────────────┘
+                     │                          │
+            ┌────────▼────────────┐    ┌────────▼────────────┐
+            │   RedisRepository   │    │    БД (Postgres)    │
+            │  GET/SET/ZADD/ZCARD │    │ INSERT/UPDATE/DELETE│
+            └────────┬────────────┘    └────────┬────────────┘
+                     │                          │ dispatch Event
+                     ▼                          ▼
   ┌─────────────────────┐       ┌─────────────────────┐
-  │   RedisRepository   │       │    БД (Postgres)    │
-  │   GET/SET/ZRANGE    │       │   INSERT/UPDATE/    │
-  └──────────┬──────────┘       │      DELETE         │
-             │                  └──────────┬──────────┘
-             ▼                             │ dispatch Event
-  ┌─────────────────────┐                  │
-  │                     │                  ▼
-  │    Redis Server     │       ┌─────────────────────┐
   │                     │       │  RedisModelChanged  │
-  │  project:7    {...} │       │  RedisPivotChanged  │
-  │  category:1   {...} │       └──────────┬──────────┘
-  │                     │                  │
-  │  project:7:         │                  ▼
-  │   categories  [1,2] │       ┌─────────────────────┐
-  │                     │◄──────│   SyncRedisHash     │
-  │  project_tag:       │       │   SyncRedisPivot    │
-  │   7:5         {...} │       └─────────────────────┘
-  │                     │         Listener обновляет
-  └─────────────────────┘         Redis через Repository
+  │    Redis Server     │       │  RedisPivotChanged  │
+  │                     │       └──────────┬──────────┘
+  │  project:7    {...} │                  │
+  │  category:1   {...} │                  ▼
+  │                     │       ┌─────────────────────┐
+  │  project:7:         │       │   SyncRedisHash     │
+  │   categories  [1,2] │◄──────│   SyncRedisPivot    │
+  │                     │       └─────────────────────┘
+  │  project_tag:       │         Listener → Repository
+  │   7:5         {...} │         → обновить Redis
+  └─────────────────────┘
 
   READ:  Redis hit → вернуть
          Redis miss → БД (Postgres) → записать в Redis → вернуть
-  WRITE: БД (Postgres) → Event → Listener → обновить Redis
+  WRITE: БД (Postgres) → model event → Listener → Redis
 ```
 
 ### Принцип хранения
@@ -182,7 +181,8 @@ $project->tags()->detach(5);
 ├─────────────────────────────────────────────────────────────┤
 │  Слой 2: RedisBuilder                                       │
 │  Перехват find/findMany/with/first/paginate                 │
-│  При WRITE — только dispatch event, НЕ пишет в Redis        │
+│  При WRITE — Builder не участвует. Eloquent model events    │
+│  (bootHasRedisCache) кидают event → Listener → Redis        │
 ├─────────────────────────────────────────────────────────────┤
 │  Слой 3: RedisRepository                                    │
 │  Обёртка над Redis (GET/SET/ZADD/ZRANGE/ZCARD)              │
@@ -243,8 +243,8 @@ Project::with('tags')->find(7)
 ### WRITE — `$project->update([...])`
 
 ```
-parent::update() → Postgres UPDATE
-  → event(RedisModelChanged($project, 'updated', ['name']))
+Eloquent save → Postgres UPDATE
+  → bootHasRedisCache (updated hook) → event(RedisModelChanged($project, 'updated', ['name']))
     → SyncRedisHash::handle()
       → Repository::set('project:7', attributes)
 ```
@@ -254,7 +254,7 @@ parent::update() → Postgres UPDATE
 ```
 $task->update(['category_id' => 2])  // было 1
   → Postgres UPDATE
-  → SyncRedisHash::handle()
+  → bootHasRedisCache (updated hook) → SyncRedisHash::handle()
     → Repository::set('task:15', attributes)
     → Repository::removeFromIndex('category:1:tasks', 15)
     → Repository::addToIndex('category:2:tasks', 15, $score)
@@ -265,7 +265,7 @@ $task->update(['category_id' => 2])  // было 1
 ```
 $project->tags()->attach([5, 8], ['role' => 'primary'])
   → Postgres INSERT в pivot
-  → SyncRedisPivot::handle()
+  → RedisBelongsToMany dispatch event → SyncRedisPivot::handle()
     → Repository::addToIndex('project:7:tags', 5, $score)
     → Repository::addToIndex('tag:5:projects', 7, $score)  // обратный индекс
     → Repository::set('project_tag:7:5', {pivot attrs})
@@ -361,7 +361,7 @@ make tests
 make stan
 ```
 
-Покрытие: 164 теста — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии).
+Покрытие: 170 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии).
 
 ---
 

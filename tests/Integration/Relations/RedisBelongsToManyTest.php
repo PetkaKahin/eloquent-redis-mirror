@@ -169,6 +169,24 @@ it('sync без изменений', function () {
     ]);
 });
 
+it('sync с обновлёнными pivot-атрибутами включает обновлённый ID в event', function () {
+    $project = Project::create(['name' => 'Test']);
+    $tag = Tag::create(['name' => 'Tag']);
+    $project->tags()->attach([$tag->id => ['role' => 'old']]);
+
+    Event::fake([RedisPivotChanged::class]);
+
+    // Sync same tag but with updated pivot attributes
+    $project->tags()->sync([$tag->id => ['role' => 'new']]);
+
+    Event::assertDispatched(RedisPivotChanged::class, function ($event) use ($tag) {
+        return $event->action === 'synced'
+            && in_array($tag->id, $event->ids)
+            && isset($event->pivotAttributes[$tag->id])
+            && $event->pivotAttributes[$tag->id]['role'] === 'new';
+    });
+});
+
 // ─── toggle() ───────────────────────────────────────────────
 
 it('toggle переключает состояние и кидает event', function () {

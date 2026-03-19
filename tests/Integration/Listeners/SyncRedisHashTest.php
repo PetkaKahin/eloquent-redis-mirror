@@ -194,6 +194,42 @@ it('deleted модели которой нет в Redis — без ошибок'
     $this->listener->handle($event);
 })->throwsNoExceptions();
 
+// ─── Негативный кейс: родитель без trait ────────────────────
+
+it('created НЕ добавляет в индекс если родитель без HasRedisCache', function () {
+    // PlainModel does not have HasRedisCache, so SyncRedisHash should
+    // skip index creation even though the child model does.
+    // We simulate this by directly calling the listener with a plain model event:
+    // PlainModel doesn't have the trait → usesRedisCache returns false → nothing happens.
+    $plainModel = \PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\PlainModel::create(['name' => 'Test']);
+
+    $event = new RedisModelChanged($plainModel, 'created');
+    $this->listener->handle($event);
+
+    // PlainModel has no Redis prefix, so nothing should be written
+    expect($this->repository->get("plain_model:{$plainModel->id}"))->toBeNull();
+})->throwsNoExceptions();
+
+// ─── Resilience: Redis недоступен ───────────────────────────
+
+it('handle не бросает exception когда Redis недоступен', function () {
+    $project = Project::create(['name' => 'Test']);
+
+    $broken = new \Illuminate\Redis\RedisManager(app(), 'phpredis', [
+        'default' => ['host' => 'localhost', 'port' => 63790, 'database' => 15, 'read_write_timeout' => 1],
+    ]);
+    app()->instance('redis', $broken);
+    \Illuminate\Support\Facades\Redis::clearResolvedInstances();
+
+    // Rebuild listener with broken Redis (repository is singleton — rebind it)
+    $brokenListener = new \PetkaKahin\EloquentRedisMirror\Listeners\SyncRedisHash(
+        new \PetkaKahin\EloquentRedisMirror\Repository\RedisRepository()
+    );
+
+    $event = new RedisModelChanged($project, 'created');
+    $brokenListener->handle($event);
+})->throwsNoExceptions();
+
 it('deleted каскадно НЕ удаляет дочерние записи', function () {
     $project = Project::create(['name' => 'Test']);
     $category = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
