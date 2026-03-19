@@ -291,8 +291,8 @@ $project->tags()->attach([5, 8], ['role' => 'primary'])
 
 | Метод | Поведение |
 |-------|-----------|
-| `find($id)` | Redis → hit: вернуть, miss: Postgres → записать в Redis |
-| `findMany($ids)` | Pipeline GET → промахи одним WHERE IN → Pipeline SET |
+| `find($id)` | Redis → hit + проверка WHERE/scopes → miss: Postgres → записать в Redis |
+| `findMany($ids)` | Pipeline GET → проверка WHERE/scopes → промахи одним WHERE IN → Pipeline SET |
 | `with('relation')` | ZRANGE из индекса → findMany по ID |
 | `first()` через relation | ZRANGE 0 0 → find по ID |
 | `paginate()` через relation | ZCARD + ZRANGE LIMIT → findMany → LengthAwarePaginator |
@@ -323,6 +323,10 @@ $project->tags()->attach([5, 8], ['role' => 'primary'])
 
 Два параллельных обновления одной записи: оба пишут в Postgres (разруливается транзакциями), оба кидают event, второй listener перезапишет Redis. Итог корректный — last-write-wins, source of truth всегда Postgres.
 
+### SoftDeletes
+
+Модели с `SoftDeletes` полностью поддерживаются. `find()` корректно проверяет `deleted_at` из Redis-кеша через global scopes. `restored` event синхронизирует восстановленную запись обратно в Redis.
+
 ### Только Eloquent-операции
 
 `DB::table()->insert()`, raw SQL и query builder без моделей **не перехватываются** — Redis не узнает об изменениях. Синхронизация работает только через Eloquent model events.
@@ -341,8 +345,12 @@ src/
 │   └── RedisRepository.php            # Обёртка над Redis-командами
 ├── Relations/
 │   └── RedisBelongsToMany.php         # BelongsToMany с event dispatch
+├── Concerns/
+│   └── ResolvesRedisRelations.php     # Shared: reverse relations, scoring
+├── Contracts/
+│   └── HasRedisCacheInterface.php     # Внутренний контракт
 ├── Events/
-│   ├── RedisModelChanged.php          # Event: create/update/delete
+│   ├── RedisModelChanged.php          # Event: create/update/delete/restore
 │   └── RedisPivotChanged.php          # Event: attach/detach/sync/toggle
 ├── Listeners/
 │   ├── SyncRedisHash.php              # Обновляет хеш записи + индексы
@@ -363,7 +371,7 @@ make tests
 make stan
 ```
 
-Покрытие: 171 тест — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии).
+Покрытие: 192 теста — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints).
 
 ---
 
