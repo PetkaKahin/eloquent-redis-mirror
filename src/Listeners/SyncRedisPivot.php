@@ -259,8 +259,8 @@ class SyncRedisPivot
                 foreach ($ids as $id) {
                     $data = $cached[$prefix . ':' . $id] ?? null;
 
-                    if ($data !== null && isset($data['created_at'])) {
-                        $scores[$id] = $this->scoreFromAttributes($data);
+                    if ($data !== null) {
+                        $scores[$id] = $this->scoreFromAttributes($data, $relatedModel);
                     } else {
                         $missedIds[] = $id;
                     }

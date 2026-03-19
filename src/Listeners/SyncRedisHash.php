@@ -29,10 +29,10 @@ class SyncRedisHash
     {
         try {
             match ($event->action) {
-                'created' => $this->handleCreated($event->model),
-                'updated' => $this->handleUpdated($event->model, $event->dirty),
-                'deleted' => $this->handleDeleted($event->model),
-                default   => null,
+                'created', 'restored' => $this->handleCreated($event->model),
+                'updated'             => $this->handleUpdated($event->model, $event->dirty),
+                'deleted'             => $this->handleDeleted($event->model),
+                default               => null,
             };
         } catch (Exception $e) {
             logger()->warning('SyncRedisHash: Redis sync failed', [

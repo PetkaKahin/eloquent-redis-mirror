@@ -27,6 +27,39 @@ class RedisBuilder extends Builder
 
     protected ?RedisRepository $repositoryInstance = null;
 
+    /** @var Builder<Model>|null */
+    protected ?Builder $wrappedBuilder = null;
+
+    /**
+     * @param Builder<Model> $builder
+     */
+    public function setWrappedBuilder(Builder $builder): static
+    {
+        $this->wrappedBuilder = $builder;
+
+        return $this;
+    }
+
+    /**
+     * Delegate unknown method calls to the wrapped builder (e.g. SortableBuilder::sorted()).
+     * Since __call is only invoked for methods not on this class, method_exists on the
+     * wrappedBuilder will only match methods unique to the custom builder class.
+     *
+     * @param string $method
+     * @param array<int, mixed> $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        if ($this->wrappedBuilder !== null && method_exists($this->wrappedBuilder, $method)) {
+            $result = $this->wrappedBuilder->$method(...$parameters);
+
+            return $result === $this->wrappedBuilder ? $this : $result;
+        }
+
+        return parent::__call($method, $parameters);
+    }
+
     /**
      * @param Model&HasRedisCacheInterface $parent
      */
@@ -331,6 +364,20 @@ class RedisBuilder extends Builder
 
         if (!$this->usesRedisCache($relatedModel)) {
             return false;
+        }
+
+        if ($constraints instanceof \Closure) {
+            $testQuery = $relatedModel->newQuery();
+            $beforeWheres = $testQuery->getQuery()->wheres;
+            $beforeOrders = $testQuery->getQuery()->orders;
+            $beforeLimit = $testQuery->getQuery()->limit;
+            $constraints($testQuery);
+            $hasRealConstraints = $testQuery->getQuery()->wheres !== $beforeWheres
+                || $testQuery->getQuery()->orders !== $beforeOrders
+                || $testQuery->getQuery()->limit !== $beforeLimit;
+            if ($hasRealConstraints) {
+                return false;
+            }
         }
 
         $repository = $this->repository();
