@@ -1,0 +1,15 @@
+# Auto-detect text files and normalise line endings
+* text=auto
+
+# Exclude from export (composer --prefer-dist, Packagist archive)
+/.claude           export-ignore
+/.github           export-ignore
+/docker-compose.yml export-ignore
+/Dockerfile        export-ignore
+/Makefile          export-ignore
+/tests             export-ignore
+/phpstan.neon      export-ignore
+/.gitattributes    export-ignore
+/.gitignore        export-ignore
+/SPECIFICATION.md  export-ignore
+/TESTS_*.md        export-ignore
