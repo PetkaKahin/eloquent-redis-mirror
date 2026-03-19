@@ -71,10 +71,27 @@ trait ResolvesRedisRelations
     }
 
     /**
-     * Get the sort score from a model instance (uses created_at timestamp).
+     * Get the sort score from a model instance.
+     * Supports custom score via getRedisSortScore() method or getRedisSortField() method on the model.
      */
     protected function scoreFromModel(Model $model): float
     {
+        if (method_exists($model, 'getRedisSortScore')) {
+            /** @var float|int $score */
+            $score = $model->getRedisSortScore();
+
+            return (float) $score;
+        }
+
+        $sortField = $this->getSortField($model);
+
+        if ($sortField !== 'created_at') {
+            $value = $model->getAttribute($sortField);
+
+            /** @var float|int|string|null $value */
+            return $value !== null ? (float) $value : (float) time();
+        }
+
         $createdAt = $model->getAttribute('created_at');
 
         return $createdAt instanceof DateTimeInterface
@@ -87,8 +104,21 @@ trait ResolvesRedisRelations
      *
      * @param array<string, mixed> $attributes
      */
-    protected function scoreFromAttributes(array $attributes): float
+    protected function scoreFromAttributes(array $attributes, ?Model $model = null): float
     {
+        $sortField = $this->getSortField($model);
+
+        if ($sortField !== 'created_at') {
+            if (isset($attributes[$sortField])) {
+                /** @var float|int|string $val */
+                $val = $attributes[$sortField];
+
+                return (float) $val;
+            }
+
+            return (float) time();
+        }
+
         if (!isset($attributes['created_at'])) {
             return (float) time();
         }
@@ -96,5 +126,20 @@ trait ResolvesRedisRelations
         $ts = strtotime((string) $attributes['created_at']);
 
         return $ts !== false ? (float) $ts : (float) time();
+    }
+
+    /**
+     * Determine the sort field for a model.
+     */
+    protected function getSortField(?Model $model): string
+    {
+        if ($model !== null && method_exists($model, 'getRedisSortField')) {
+            /** @var string $field */
+            $field = $model->getRedisSortField();
+
+            return $field;
+        }
+
+        return 'created_at';
     }
 }

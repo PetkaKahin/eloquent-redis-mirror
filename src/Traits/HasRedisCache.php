@@ -6,7 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\Relation;
-use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Support\Str;
 use PetkaKahin\EloquentRedisMirror\Builder\RedisBuilder;
 use PetkaKahin\EloquentRedisMirror\Events\RedisModelChanged;
@@ -38,6 +38,12 @@ trait HasRedisCache
         static::deleted(static function (Model $model): void {
             event(new RedisModelChanged($model, 'deleted'));
         });
+
+        if (in_array(\Illuminate\Database\Eloquent\SoftDeletes::class, class_uses_recursive(static::class))) {
+            static::restored(static function (Model $model): void {
+                event(new RedisModelChanged($model, 'restored'));
+            });
+        }
     }
 
     public static function getRedisPrefix(): string
@@ -77,11 +83,29 @@ trait HasRedisCache
     }
 
     /**
-     * @param QueryBuilder $query
+     * Override newModelQuery to always return a RedisBuilder, wrapping any custom builder.
+     * This ensures Redis interception works even when the model defines its own newEloquentBuilder().
+     *
+     * @return RedisBuilder
      */
-    public function newEloquentBuilder($query): RedisBuilder
+    public function newModelQuery()
     {
-        return new RedisBuilder($query);
+        $baseQuery = $this->newBaseQueryBuilder();
+        $originalBuilder = $this->newEloquentBuilder($baseQuery)->setModel($this);
+
+        if ($originalBuilder instanceof RedisBuilder) {
+            return $originalBuilder;
+        }
+
+        if (get_class($originalBuilder) === EloquentBuilder::class) {
+            return (new RedisBuilder($baseQuery))->setModel($this);
+        }
+
+        $redisBuilder = new RedisBuilder($baseQuery);
+        $redisBuilder->setModel($this);
+        $redisBuilder->setWrappedBuilder($originalBuilder);
+
+        return $redisBuilder;
     }
 
     /**
