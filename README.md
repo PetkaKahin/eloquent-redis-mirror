@@ -120,6 +120,8 @@ class Project extends Model
 }
 ```
 
+`$redisRelations` — массив имён relation-методов, для которых пакет будет хранить индексы в Redis (Sorted Set). Это позволяет `with()`, `first()` и `paginate()` через relation работать из Redis. Если модель — leaf (нет дочерних relations для кеширования), укажите пустой массив `[]`.
+
 ### 2. Добавьте trait к связанным моделям
 
 Каждая модель в цепочке eager loading должна подключать trait:
