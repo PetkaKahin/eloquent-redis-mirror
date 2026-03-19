@@ -6,7 +6,9 @@ use Exception;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Pagination\LengthAwarePaginator;
@@ -410,6 +412,43 @@ class RedisBuilder extends Builder
             }
         }
 
+        // BelongsTo: the FK lives on the parent model — no Sorted Set index needed.
+        // Use findMany (which hits Redis) to resolve all related models in one shot.
+        if ($relation instanceof BelongsTo) {
+            $fkName   = $relation->getForeignKeyName();
+            $ownerKey = $relation->getOwnerKeyName();
+
+            /** @var array<int, mixed> $fkValues */
+            $fkValues = [];
+            foreach ($models as $i => $model) {
+                $fkValues[$i] = $model->getAttribute($fkName);
+            }
+
+            $uniqueIds = array_values(array_unique(array_filter(
+                $fkValues,
+                static fn (mixed $v): bool => $v !== null,
+            )));
+
+            $query = $relatedModel->newQuery();
+            if ($nested !== null) {
+                $query->with($nested);
+            }
+
+            /** @var \Illuminate\Database\Eloquent\Collection<int, Model> $found */
+            $found      = empty($uniqueIds) ? $relatedModel->newCollection() : $query->findMany($uniqueIds);
+            $foundByKey = $found->keyBy($ownerKey);
+
+            foreach ($models as $i => $model) {
+                $fkValue = $fkValues[$i];
+                $models[$i]->setRelation(
+                    $directRelation,
+                    $fkValue !== null ? ($foundByKey[$fkValue] ?? null) : null,
+                );
+            }
+
+            return true;
+        }
+
         $repository = $this->repository();
         /** @var Model&HasRedisCacheInterface $relatedModel */
         $relatedPrefix = $relatedModel::getRedisPrefix();
@@ -587,7 +626,11 @@ class RedisBuilder extends Builder
                     $collection = $relatedModel->newCollection($relatedArray);
                 }
 
-                $models[$i]->setRelation($directRelation, $collection);
+                // HasOne expects a single model, not a collection
+                $models[$i]->setRelation(
+                    $directRelation,
+                    $relation instanceof HasOne ? $collection->first() : $collection,
+                );
             }
 
             // ── Cold-start: single batch query instead of N individual queries ──
@@ -702,7 +745,11 @@ class RedisBuilder extends Builder
                             $dbRelated = $relatedModel->newCollection($relatedArray);
                         }
 
-                        $models[$i]->setRelation($directRelation, $dbRelated);
+                        // HasOne expects a single model, not a collection
+                        $models[$i]->setRelation(
+                            $directRelation,
+                            $relation instanceof HasOne ? $dbRelated->first() : $dbRelated,
+                        );
                     }
                 }
 
@@ -783,13 +830,19 @@ class RedisBuilder extends Builder
                     if ($nested !== null) {
                         $dbRelated->load($nested);
                     }
-                    $model->setRelation($directRelation, $dbRelated);
+                    // HasOne expects a single model, not a collection
+                    $model->setRelation(
+                        $directRelation,
+                        $relation instanceof HasOne ? $dbRelated->first() : $dbRelated,
+                    );
                 }
             } else {
+                // Fallback for BelongsTo and any other relation type not handled above.
+                // getResults() returns the correct type (Model|null for BelongsTo/HasOne,
+                // Collection for HasMany), unlike get() which always returns a Collection.
                 foreach ($models as $model) {
-                    /** @var Collection<int, Model> $dbRelated */
-                    $dbRelated = $model->$directRelation()->get();
-                    if ($nested !== null) {
+                    $dbRelated = $model->$directRelation()->getResults();
+                    if ($nested !== null && $dbRelated instanceof Model) {
                         $dbRelated->load($nested);
                     }
                     $model->setRelation($directRelation, $dbRelated);

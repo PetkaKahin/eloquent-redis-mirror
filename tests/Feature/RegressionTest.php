@@ -397,6 +397,63 @@ it('parallel findMany с одинаковыми ID не дублирует', fun
     expect($found->count())->toBeGreaterThanOrEqual(2);
 });
 
+// ═══════════════════════════════════════════════════════════════
+// BUG 4: BelongsTo eager load возвращает коллекцию вместо модели
+// $task->category должен быть Category, не Collection
+// ═══════════════════════════════════════════════════════════════
+
+it('eager load BelongsTo возвращает модель, не коллекцию', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat     = Category::create(['project_id' => $project->id, 'name' => 'Dev']);
+    $task    = Task::create(['category_id' => $cat->id, 'title' => 'Fix bug']);
+
+    $loaded = Task::with('category')->find($task->id);
+
+    expect($loaded->category)->toBeInstanceOf(Category::class);
+    expect($loaded->category->id)->toBe($cat->id);
+    expect($loaded->category->project_id)->toBe($project->id);
+});
+
+it('lazy load BelongsTo возвращает модель, не коллекцию', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat     = Category::create(['project_id' => $project->id, 'name' => 'Dev']);
+    $task    = Task::create(['category_id' => $cat->id, 'title' => 'Fix bug']);
+
+    $loaded = Task::find($task->id);
+
+    expect($loaded->category)->toBeInstanceOf(Category::class);
+    expect($loaded->category->id)->toBe($cat->id);
+});
+
+it('eager load BelongsTo работает при повторном чтении из Redis', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat     = Category::create(['project_id' => $project->id, 'name' => 'Dev']);
+    $task    = Task::create(['category_id' => $cat->id, 'title' => 'Fix bug']);
+
+    // Первый запрос прогревает Redis
+    Task::with('category')->find($task->id);
+
+    // Второй запрос из Redis
+    $loaded = Task::with('category')->find($task->id);
+
+    expect($loaded->category)->toBeInstanceOf(Category::class);
+    expect($loaded->category->id)->toBe($cat->id);
+    expect($loaded->category->name)->toBe('Dev');
+});
+
+it('eager load цепочки BelongsTo→BelongsTo работает', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat     = Category::create(['project_id' => $project->id, 'name' => 'Dev']);
+    $task    = Task::create(['category_id' => $cat->id, 'title' => 'Fix bug']);
+
+    $loaded = Task::with('category.project')->find($task->id);
+
+    expect($loaded->category)->toBeInstanceOf(Category::class);
+    expect($loaded->category->project)->toBeInstanceOf(Project::class);
+    expect($loaded->category->project->id)->toBe($project->id);
+    expect($loaded->category->project->name)->toBe('Test');
+});
+
 it('find с where scope фолбэчит в DB', function () {
     $p1 = Project::create(['name' => 'Active', 'is_active' => true]);
     $p2 = Project::create(['name' => 'Inactive', 'is_active' => false]);
