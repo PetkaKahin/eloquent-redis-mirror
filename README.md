@@ -361,7 +361,7 @@ make tests
 make stan
 ```
 
-Покрытие: 170 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии).
+Покрытие: 171 тест — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии).
 
 ---
 
