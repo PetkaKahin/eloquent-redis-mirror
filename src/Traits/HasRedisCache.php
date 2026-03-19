@@ -32,9 +32,7 @@ trait HasRedisCache
             $updatedAtColumn = $model->getUpdatedAtColumn();
             $dirty           = array_values(array_diff($dirty, [$updatedAtColumn]));
 
-            if (!empty($dirty)) {
-                event(new RedisModelChanged($model, 'updated', $dirty));
-            }
+            event(new RedisModelChanged($model, 'updated', $dirty));
         });
 
         static::deleted(static function (Model $model): void {

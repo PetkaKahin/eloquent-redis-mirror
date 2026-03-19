@@ -200,6 +200,10 @@ class RedisBuilder extends Builder
             }
         }
 
+        if (!empty($this->eagerLoad) && !empty($ordered)) {
+            $ordered = $this->eagerLoadRelations($ordered);
+        }
+
         return $this->getModel()->newCollection($ordered);
     }
 
