@@ -88,8 +88,15 @@ trait ResolvesRedisRelations
         if ($sortField !== 'created_at') {
             $value = $model->getAttribute($sortField);
 
-            /** @var float|int|string|null $value */
-            return $value !== null ? (float) $value : (float) time();
+            if ($value === null) {
+                return (float) time();
+            }
+
+            if (is_numeric($value)) {
+                return (float) $value;
+            }
+
+            return $this->stringToScore((string) $value);
         }
 
         $createdAt = $model->getAttribute('created_at');
@@ -113,7 +120,11 @@ trait ResolvesRedisRelations
                 /** @var float|int|string $val */
                 $val = $attributes[$sortField];
 
-                return (float) $val;
+                if (is_numeric($val)) {
+                    return (float) $val;
+                }
+
+                return $this->stringToScore((string) $val);
             }
 
             return (float) time();
@@ -126,6 +137,23 @@ trait ResolvesRedisRelations
         $ts = strtotime((string) $attributes['created_at']);
 
         return $ts !== false ? (float) $ts : (float) time();
+    }
+
+    /**
+     * Convert a non-numeric string to an order-preserving float score.
+     * Maps each character's ordinal value to a positional weight so that
+     * lexicographic ordering is preserved: "aaa" < "aab" < "b".
+     */
+    protected function stringToScore(string $value): float
+    {
+        $score = 0.0;
+        $len = min(strlen($value), 8);
+
+        for ($i = 0; $i < $len; $i++) {
+            $score += ord($value[$i]) / (256 ** ($i + 1));
+        }
+
+        return $score;
     }
 
     /**
