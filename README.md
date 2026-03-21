@@ -8,12 +8,15 @@ class Project extends Model
     use HasRedisCache;
 
     protected array $redisRelations = ['categories', 'tags'];
+
+    // Опционально: сортировка по pivot-колонке вместо атрибута модели
+    protected array $redisPivotScore = ['tags' => 'position'];
 }
 
 // Всё работает без изменений — но данные читаются из Redis:
 Project::find(7);
 Project::with('categories.tasks')->find(7);
-$project->tags()->attach([5, 8], ['role' => 'primary']);
+$project->tags()->attach([5, 8], ['role' => 'primary', 'position' => 1]);
 $project->categories()->paginate(15);
 ```
 
@@ -120,7 +123,7 @@ class Project extends Model
 }
 ```
 
-`$redisRelations` — массив имён relation-методов, для которых пакет будет хранить индексы в Redis (Sorted Set). Это позволяет `with()`, `first()` и `paginate()` через relation работать из Redis. Если модель — leaf (нет дочерних relations для кеширования), укажите пустой массив `[]`.
+`$redisRelations` — массив имён relation-методов, для которых пакет будет хранить индексы в Redis (Sorted Set). Это позволяет `with()`, `first()` и `paginate()` через relation работать из Redis. Если модель — leaf (нет дочерних relations для кеширования), укажите пустой массив `[]`. Опциональный `$redisPivotScore` позволяет сортировать BelongsToMany по pivot-колонке — см. [Сортировка по pivot-колонке](#сортировка-по-pivot-колонке).
 
 ### 2. Добавьте trait к связанным моделям
 
@@ -169,6 +172,39 @@ $project->tags()->attach([5, 8], ['role' => 'primary']);
 $project->tags()->sync([5, 10]);
 $project->tags()->detach(5);
 ```
+
+---
+
+## Сортировка по pivot-колонке
+
+По умолчанию sorted set индексы используют атрибуты связанной модели для score (например, `created_at`). Если порядок определяется pivot-колонкой (как `position` в `BelongsToSortedMany` из lexorank-sortable), добавьте `$redisPivotScore`:
+
+```php
+class Project extends Model
+{
+    use HasRedisCache;
+
+    protected array $redisRelations = ['tags'];
+
+    // Ключ — имя relation, значение — колонка в pivot-таблице
+    protected array $redisPivotScore = [
+        'tags' => 'position',
+    ];
+
+    public function tags(): BelongsToMany
+    {
+        return $this->belongsToMany(Tag::class);
+    }
+}
+```
+
+`ZADD project:7:tags` использует `pivot.position` как score вместо `tag.created_at`. Каждый проект хранит свой порядок тегов.
+
+Конфигурация — per-direction: `Project` сортирует теги по `position`, а `Tag` — проекты по `created_at` (или по своей pivot-колонке).
+
+Поддерживаются числовые значения (`1`, `2`, `3`) и строковые (lexorank: `aaa|bbb`). Строки конвертируются в float с сохранением лексикографического порядка.
+
+При обновлении pivot (`updateExistingPivot`) score в sorted set обновляется автоматически.
 
 ---
 
@@ -391,7 +427,7 @@ make tests
 make stan
 ```
 
-Покрытие: 282 теста — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity).
+Покрытие: 288 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring).
 
 ---
 
