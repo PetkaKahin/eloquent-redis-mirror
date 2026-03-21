@@ -67,6 +67,17 @@ class RedisBuilder extends Builder
      */
     public function __call($method, $parameters)
     {
+        // Intercept exists()/doesntExist() before Eloquent\Builder's passthru
+        // sends them to Query\Builder. These methods live on Query\Builder,
+        // not Eloquent\Builder, so without this they'd bypass Redis entirely.
+        if ($method === 'exists') {
+            return $this->redisExists();
+        }
+
+        if ($method === 'doesntExist') {
+            return !$this->redisExists();
+        }
+
         if ($this->wrappedBuilder !== null && method_exists($this->wrappedBuilder, $method)) {
             $result = $this->wrappedBuilder->$method(...$parameters);
 
@@ -451,35 +462,39 @@ class RedisBuilder extends Builder
      * Check existence via Redis sorted set when in relation context.
      * Falls back to SQL when no relation context, extra constraints
      * (wherePivot, groups, distinct) exist, or cold start.
+     *
+     * Called via __call('exists') — exists() is defined on Query\Builder,
+     * not Eloquent\Builder, so a real method on RedisBuilder would be
+     * bypassed by the passthru mechanism in Eloquent\Builder::__call.
      */
-    public function exists(): bool
+    protected function redisExists(): bool
     {
         if ($this->dbFallback) {
-            return parent::exists();
+            return $this->toBase()->exists();
         }
 
         $indexKey = $this->getRelationIndexKey();
 
         if ($indexKey === null) {
-            return parent::exists();
+            return $this->toBase()->exists();
         }
 
         // Extra wheres beyond the relation's base constraints (e.g. wherePivot) → SQL
         $baseQuery = $this->getQuery();
         if (count($baseQuery->wheres) > $this->baseWhereCount || !empty($baseQuery->groups) || $baseQuery->distinct) {
-            return parent::exists();
+            return $this->toBase()->exists();
         }
 
         try {
             $count = $this->repository()->getRelationCountChecked($indexKey);
 
             if ($count === null) {
-                return parent::exists();
+                return $this->toBase()->exists();
             }
 
             return $count > 0;
         } catch (Exception) {
-            return parent::exists();
+            return $this->toBase()->exists();
         }
     }
 
