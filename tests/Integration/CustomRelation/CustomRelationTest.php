@@ -248,6 +248,75 @@ it('dispatchPivotChange синхронизирует Redis при detach кас�
     expect($ids)->toBeEmpty();
 });
 
+// ─── exists() на custom relation через withRedisContext ──────────
+
+it('exists() через custom BelongsToMany возвращает true из Redis (zero SQL)', function () {
+    $project = CustomRelationProject::create(['name' => 'Test']);
+    $tag = Tag::create(['name' => 'Tag']);
+    // Warm index via dispatchPivotChange
+    DB::table('project_tag')->insert([
+        'project_id' => $project->id,
+        'tag_id' => $tag->id,
+    ]);
+    $project->dispatchPivotChange('tags', 'attached', [$tag->id]);
+
+    DB::enableQueryLog();
+
+    $exists = $project->tags()->exists();
+
+    $selectQueries = collect(DB::getQueryLog())->filter(
+        fn ($q) => str_starts_with(strtolower($q['query']), 'select')
+    );
+    expect($selectQueries)->toBeEmpty();
+    expect($exists)->toBeTrue();
+});
+
+it('exists() через custom BelongsToMany возвращает false для пустого warmed индекса', function () {
+    $project = CustomRelationProject::create(['name' => 'Test']);
+    $indexKey = $project->getRedisIndexKey('tags');
+    $this->repository->executeBatch(markWarmed: [$indexKey]);
+
+    DB::enableQueryLog();
+
+    $exists = $project->tags()->exists();
+
+    $selectQueries = collect(DB::getQueryLog())->filter(
+        fn ($q) => str_starts_with(strtolower($q['query']), 'select')
+    );
+    expect($selectQueries)->toBeEmpty();
+    expect($exists)->toBeFalse();
+});
+
+it('exists() через custom BelongsToMany при cold start фолбэчит в SQL', function () {
+    $project = CustomRelationProject::create(['name' => 'Test']);
+    $tag = Tag::create(['name' => 'Tag']);
+    DB::table('project_tag')->insert([
+        'project_id' => $project->id,
+        'tag_id' => $tag->id,
+    ]);
+    Redis::flushdb();
+
+    $exists = $project->tags()->exists();
+
+    expect($exists)->toBeTrue();
+});
+
+it('exists() через custom BelongsToMany с wherePivot фолбэчит в SQL', function () {
+    $project = CustomRelationProject::create(['name' => 'Test']);
+    $tag = Tag::create(['name' => 'Tag']);
+    DB::table('project_tag')->insert([
+        'project_id' => $project->id,
+        'tag_id' => $tag->id,
+        'role' => 'primary',
+    ]);
+    $project->dispatchPivotChange('tags', 'attached', [$tag->id], [$tag->id => ['role' => 'primary']]);
+
+    // wherePivot adds extra where → SQL fallback
+    $exists = $project->tags()->wherePivot('role', 'primary')->exists();
+
+    expect($exists)->toBeTrue();
+});
+
 // ─── Relation type on custom_relation_project has correct prefix ───
 
 it('CustomRelationProject использует правильный redis prefix', function () {

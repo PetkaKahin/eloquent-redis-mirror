@@ -34,13 +34,15 @@ class CustomRelationProject extends Model
     /**
      * Custom relation method — returns CustomBelongsToSortedMany instead of standard BelongsToMany.
      * This simulates a third-party package like belongsToSortedMany().
+     * Uses withRedisContext() so that exists()/get()/count() can be served from Redis.
      */
     public function tags(): CustomBelongsToSortedMany
     {
         $instance = $this->newRelatedInstance(Tag::class);
         $table = 'project_tag';
 
-        return new CustomBelongsToSortedMany(
+        /** @var CustomBelongsToSortedMany */
+        return $this->withRedisContext('tags', new CustomBelongsToSortedMany(
             $instance->newQuery(),
             $this,
             $table,
@@ -49,6 +51,6 @@ class CustomRelationProject extends Model
             $this->getKeyName(),
             $instance->getKeyName(),
             'tags',
-        );
+        ));
     }
 }
