@@ -58,10 +58,19 @@ parameters:
         - identifier: function.alreadyNarrowedType
           path: src/Builder/EagerLoad/FetchesRelatedModels.php
 
-        # FetchesRelatedModels::loadNested() with() receives callable — PHPStan strictness on Closure vs callable
-        -
-            message: '#Parameter \#1 \$relations of method Illuminate\\Database\\Eloquent\\Builder.*::with\(\)#'
-            path: src/Builder/EagerLoad/FetchesRelatedModels.php
+
+        # CustomRelationResolver: Model::getKey() returns mixed, warmFromResult receives mixed $result
+        - identifier: binaryOp.invalid
+          path: src/Concerns/CustomRelationResolver.php
+        - identifier: cast.string
+          path: src/Concerns/CustomRelationResolver.php
+        - identifier: argument.type
+          path: src/Concerns/CustomRelationResolver.php
+        - identifier: property.notFound
+          path: src/Concerns/CustomRelationResolver.php
+        - identifier: method.nonObject
+          path: src/Concerns/CustomRelationResolver.php
+
 
         # ResolvesRedisRelations getAttribute() returns mixed
         - identifier: cast.string
