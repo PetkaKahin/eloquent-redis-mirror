@@ -29,6 +29,47 @@ class RedisBelongsToMany extends BelongsToMany
     }
 
     /**
+     * Check existence via Redis sorted set for BelongsToMany.
+     * Falls back to SQL when extra constraints exist (wherePivot, etc.) or cold start.
+     */
+    public function exists(): bool
+    {
+        $parent = $this->getParent();
+
+        if (!$this->usesRedisCache($parent)) {
+            return parent::exists();
+        }
+
+        /** @var Model&HasRedisCacheInterface $parent */
+        $relationName = $this->getRelationName();
+
+        if (!in_array($relationName, $parent->getRedisRelations(), true)) {
+            return parent::exists();
+        }
+
+        $baseQuery = $this->getQuery()->getQuery();
+
+        // Extra wheres (e.g. wherePivot) → can't evaluate from Redis
+        if (count($baseQuery->wheres) > 1 || !empty($baseQuery->groups) || $baseQuery->distinct) {
+            return parent::exists();
+        }
+
+        $indexKey = $parent->getRedisIndexKey($relationName);
+
+        try {
+            $count = $this->repository()->getRelationCountChecked($indexKey);
+
+            if ($count === null) {
+                return parent::exists();
+            }
+
+            return $count > 0;
+        } catch (Exception) {
+            return parent::exists();
+        }
+    }
+
+    /**
      * @param list<string> $columns
      * @return Collection<int, Model>
      */

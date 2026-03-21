@@ -431,6 +431,35 @@ class RedisBuilder extends Builder
     }
 
     /**
+     * Check existence via Redis sorted set when in relation context (HasMany/HasOne).
+     * Falls back to SQL when no relation context, extra constraints exist, or cold start.
+     */
+    public function exists(): bool
+    {
+        if ($this->dbFallback) {
+            return parent::exists();
+        }
+
+        $indexKey = $this->getRelationIndexKey();
+
+        if ($indexKey === null) {
+            return parent::exists();
+        }
+
+        try {
+            $count = $this->repository()->getRelationCountChecked($indexKey);
+
+            if ($count === null) {
+                return parent::exists();
+            }
+
+            return $count > 0;
+        } catch (Exception) {
+            return parent::exists();
+        }
+    }
+
+    /**
      * @param array<int, Model> $models
      * @return array<int, Model>
      */
