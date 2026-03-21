@@ -26,6 +26,9 @@ class RedisBuilder extends Builder
     protected ?Model $relationParent = null;
     protected ?string $relationName = null;
 
+    /** Number of base query wheres at the time relation context was set. */
+    protected int $baseWhereCount = 0;
+
     protected ?RedisRepository $repositoryInstance = null;
 
     /**
@@ -80,6 +83,7 @@ class RedisBuilder extends Builder
     {
         $this->relationParent = $parent;
         $this->relationName = $relationName;
+        $this->baseWhereCount = count($this->getQuery()->wheres);
 
         return $this;
     }
@@ -444,8 +448,9 @@ class RedisBuilder extends Builder
     }
 
     /**
-     * Check existence via Redis sorted set when in relation context (HasMany/HasOne).
-     * Falls back to SQL when no relation context, extra constraints exist, or cold start.
+     * Check existence via Redis sorted set when in relation context.
+     * Falls back to SQL when no relation context, extra constraints
+     * (wherePivot, groups, distinct) exist, or cold start.
      */
     public function exists(): bool
     {
@@ -456,6 +461,12 @@ class RedisBuilder extends Builder
         $indexKey = $this->getRelationIndexKey();
 
         if ($indexKey === null) {
+            return parent::exists();
+        }
+
+        // Extra wheres beyond the relation's base constraints (e.g. wherePivot) → SQL
+        $baseQuery = $this->getQuery();
+        if (count($baseQuery->wheres) > $this->baseWhereCount || !empty($baseQuery->groups) || $baseQuery->distinct) {
             return parent::exists();
         }
 

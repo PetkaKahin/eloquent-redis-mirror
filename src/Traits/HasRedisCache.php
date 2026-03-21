@@ -257,6 +257,33 @@ trait HasRedisCache
     }
 
     /**
+     * Set Redis relation context on a custom Relation's internal builder.
+     * Wrap your custom relation return value so that methods like exists(),
+     * get(), count() can be served from Redis instead of hitting SQL.
+     *
+     * Usage:
+     *   public function projects(): BelongsToSortedMany {
+     *       return $this->withRedisContext('projects',
+     *           new BelongsToSortedMany($this->newRelatedInstance(Project::class)->newQuery(), ...)
+     *       );
+     *   }
+     *
+     * @template TRelation of Relation<Model, Model, mixed>
+     * @param TRelation $relation
+     * @return TRelation
+     */
+    protected function withRedisContext(string $relationName, Relation $relation): Relation
+    {
+        $builder = $relation->getQuery();
+
+        if ($builder instanceof RedisBuilder) {
+            $builder->setRelationContext($this, $relationName);
+        }
+
+        return $relation;
+    }
+
+    /**
      * Dispatch a RedisPivotChanged event for custom BelongsToMany relations.
      * Call this after mutations (attach/detach/sync) on custom relation types
      * that don't go through RedisBelongsToMany.
