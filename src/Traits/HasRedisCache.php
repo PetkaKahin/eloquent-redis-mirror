@@ -242,7 +242,18 @@ trait HasRedisCache
             // Redis unavailable — fall through to SQL
         }
 
-        return parent::getRelationshipFromMethod($method);
+        // SQL fallback — then warm Redis for future reads
+        $result = parent::getRelationshipFromMethod($method);
+
+        try {
+            /** @var CustomRelationResolver $resolver */
+            $resolver = $resolver ?? app(CustomRelationResolver::class);
+            $resolver->warmFromResult($this, $method, $customRelations[$method], $result);
+        } catch (\Exception) {
+            // Redis unavailable
+        }
+
+        return $result;
     }
 
     /**

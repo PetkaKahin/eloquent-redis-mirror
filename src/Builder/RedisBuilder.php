@@ -301,7 +301,10 @@ class RedisBuilder extends Builder
         $indexKey = $this->getRelationIndexKey();
 
         if ($indexKey === null) {
-            return parent::get($columns);
+            $result = parent::get($columns);
+            $this->cacheLoadedModels($result);
+
+            return $result;
         }
 
         if ($this->getQuery()->limit !== null) {
@@ -325,7 +328,10 @@ class RedisBuilder extends Builder
             $ids = $this->repository()->getRelationIdsChecked($indexKey);
 
             if ($ids === null) {
-                return parent::get($columns);
+                $result = parent::get($columns);
+                $this->warmRelationFromResult($indexKey, $result);
+
+                return $result;
             }
 
             if (empty($ids)) {
@@ -352,14 +358,20 @@ class RedisBuilder extends Builder
         $indexKey = $this->getRelationIndexKey();
 
         if ($indexKey === null) {
-            return parent::first($columns);
+            $result = parent::first($columns);
+            $this->cacheSingleModel($result);
+
+            return $result;
         }
 
         try {
             $ids = $this->repository()->getRelationIdsChecked($indexKey, 0, 0);
 
             if ($ids === null) {
-                return parent::first($columns);
+                $result = parent::first($columns);
+                $this->cacheSingleModel($result);
+
+                return $result;
             }
 
             if (empty($ids)) {
@@ -626,5 +638,98 @@ class RedisBuilder extends Builder
     protected function hydrateModel(array $attributes): Model
     {
         return $this->getModel()->newFromBuilder($attributes);
+    }
+
+    /**
+     * Cache models loaded from DB (no index, just model hashes).
+     * Used when get() has no relation context — warms Redis for future find() calls.
+     *
+     * @param Collection<int, Model> $result
+     */
+    protected function cacheLoadedModels(Collection $result): void
+    {
+        if ($result->isEmpty()) {
+            return;
+        }
+
+        $model = $this->getModel();
+
+        if (!$this->usesRedisCache($model)) {
+            return;
+        }
+
+        /** @var Model&HasRedisCacheInterface $model */
+        $prefix = $model::getRedisPrefix();
+
+        /** @var array<string, array<string, mixed>> $toCache */
+        $toCache = [];
+
+        foreach ($result as $item) {
+            $toCache[$prefix . ':' . $item->getKey()] = $item->getAttributes();
+        }
+
+        try {
+            $this->repository()->setMany($toCache);
+        } catch (Exception) {
+            // Redis unavailable
+        }
+    }
+
+    /**
+     * Cache a single model loaded from DB.
+     * Used when first() falls back to SQL.
+     */
+    protected function cacheSingleModel(?Model $model): void
+    {
+        if ($model === null || !$this->usesRedisCache($model)) {
+            return;
+        }
+
+        /** @var Model&HasRedisCacheInterface $model */
+        $key = $model::getRedisPrefix() . ':' . $model->getKey();
+
+        try {
+            $this->repository()->set($key, $model->getAttributes());
+        } catch (Exception) {
+            // Redis unavailable
+        }
+    }
+
+    /**
+     * Warm a relation index from DB results on cold start.
+     * Caches each model + populates the sorted set index + marks as warmed.
+     *
+     * @param Collection<int, Model> $result
+     */
+    protected function warmRelationFromResult(string $indexKey, Collection $result): void
+    {
+        $model = $this->getModel();
+
+        if (!$this->usesRedisCache($model)) {
+            return;
+        }
+
+        /** @var Model&HasRedisCacheInterface $model */
+        $prefix = $model::getRedisPrefix();
+
+        /** @var array<string, array<string, mixed>> $toCache */
+        $toCache = [];
+        /** @var array<int|string, float> $indexEntries */
+        $indexEntries = [];
+
+        foreach ($result as $item) {
+            $toCache[$prefix . ':' . $item->getKey()] = $item->getAttributes();
+            $indexEntries[(string) $item->getKey()] = $this->scoreFromModel($item);
+        }
+
+        try {
+            $this->repository()->executeBatch(
+                setItems: $toCache,
+                addToIndices: !empty($indexEntries) ? [$indexKey => $indexEntries] : [],
+                markWarmed: [$indexKey],
+            );
+        } catch (Exception) {
+            // Redis unavailable
+        }
     }
 }
