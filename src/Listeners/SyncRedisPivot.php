@@ -47,7 +47,14 @@ class SyncRedisPivot
             return;
         }
 
-        $scores      = $this->getScoresForIds($ctx['relatedModel'], $event->ids);
+        $pivotScoreColumn = $ctx['pivotScoreColumn'];
+
+        if ($pivotScoreColumn !== null) {
+            $scores = $this->scoresFromPivotAttributes($event->ids, $pivotScoreColumn, $event->pivotAttributes);
+        } else {
+            $scores = $this->getScoresForIds($ctx['relatedModel'], $event->ids);
+        }
+
         $parentScore = $this->scoreFromModel($event->parent);
 
         [$indexEntries, $pivotItems] = $this->buildAttachEntries(
@@ -104,8 +111,15 @@ class SyncRedisPivot
         $removeEntries     = [];
         $pivotKeysToDelete = [];
 
+        $pivotScoreColumn = $ctx['pivotScoreColumn'];
+
         if (!empty($attachedIds)) {
-            $scores      = $this->getScoresForIds($relatedModel, $attachedIds);
+            if ($pivotScoreColumn !== null) {
+                $scores = $this->scoresFromPivotAttributes($attachedIds, $pivotScoreColumn, $event->pivotAttributes);
+            } else {
+                $scores = $this->getScoresForIds($relatedModel, $attachedIds);
+            }
+
             $parentScore = $this->scoreFromModel($event->parent);
 
             // For IDs that already exist in Redis (updated pivot, not newly attached),
@@ -183,6 +197,48 @@ class SyncRedisPivot
             /** @var array<string, mixed> $mergedPivot */
             $mergedPivot = array_merge($existing, $event->pivotAttributes[$id] ?? []);
             $toWrite[$pivotKey] = $mergedPivot;
+        }
+
+        // When pivot score column is configured, update sorted set scores too
+        $pivotScoreColumn = $this->getPivotScoreColumn($parent, $relationName);
+
+        if ($pivotScoreColumn !== null) {
+            $indexKey = $parent->getRedisIndexKey($relationName);
+
+            /** @var array<string, array<int|string, float>> $indexEntries */
+            $indexEntries = [];
+            foreach ($event->ids as $id) {
+                $newVal = $event->pivotAttributes[$id][$pivotScoreColumn] ?? null;
+                if ($newVal !== null) {
+                    $indexEntries[$indexKey][$id] = $this->scoreFromPivotValue($newVal);
+                }
+            }
+
+            // Also update reverse indices if they use pivot scoring
+            if (!empty($indexEntries)) {
+                $relatedModel = $relation->getRelated();
+                $reverseInfos = $this->resolveReverseInfos($relatedModel, $parent);
+
+                foreach ($event->ids as $id) {
+                    $newVal = $event->pivotAttributes[$id][$pivotScoreColumn] ?? null;
+                    if ($newVal === null) {
+                        continue;
+                    }
+                    foreach ($reverseInfos as $ri) {
+                        if ($ri['pivotScoreColumn'] !== null) {
+                            $reverseIndexKey = $ri['prefix'] . ':' . $id . ':' . $ri['relation'];
+                            $indexEntries[$reverseIndexKey][(string) $parentId] = $this->scoreFromPivotValue($newVal);
+                        }
+                    }
+                }
+            }
+
+            $this->repository->executeBatch(
+                setItems: $toWrite,
+                addToIndices: $indexEntries,
+            );
+
+            return;
         }
 
         $this->repository->setMany($toWrite);
@@ -318,7 +374,7 @@ class SyncRedisPivot
      * Resolves the common context for pivot handlers (attached/detached/synced/toggled).
      * Returns null if the parent model does not use HasRedisCache.
      *
-     * @return array{relatedModel: Model, pivotTable: string, foreignPivotKey: string, relatedPivotKey: string, parentId: int|string, indexKey: string, reverseInfos: list<array{relation: string, prefix: string}>}|null
+     * @return array{relatedModel: Model, pivotTable: string, foreignPivotKey: string, relatedPivotKey: string, parentId: int|string, indexKey: string, reverseInfos: list<array{relation: string, prefix: string, pivotScoreColumn: string|null}>, pivotScoreColumn: string|null}|null
      */
     private function resolveFullContext(RedisPivotChanged $event): ?array
     {
@@ -339,17 +395,18 @@ class SyncRedisPivot
         $relatedPivotKey = $relation->getRelatedPivotKeyName();
 
         /** @var int|string $parentId */
-        $parentId     = $parent->getKey();
-        $indexKey     = $parent->getRedisIndexKey($relationName);
-        $reverseInfos = $this->resolveReverseInfos($relatedModel, $parent);
+        $parentId         = $parent->getKey();
+        $indexKey          = $parent->getRedisIndexKey($relationName);
+        $reverseInfos      = $this->resolveReverseInfos($relatedModel, $parent);
+        $pivotScoreColumn = $this->getPivotScoreColumn($parent, $relationName);
 
-        return compact('relatedModel', 'pivotTable', 'foreignPivotKey', 'relatedPivotKey', 'parentId', 'indexKey', 'reverseInfos');
+        return compact('relatedModel', 'pivotTable', 'foreignPivotKey', 'relatedPivotKey', 'parentId', 'indexKey', 'reverseInfos', 'pivotScoreColumn');
     }
 
     /**
      * Resolves ALL reverse-relation infos for the related model if it uses HasRedisCache.
      *
-     * @return list<array{relation: string, prefix: string}>
+     * @return list<array{relation: string, prefix: string, pivotScoreColumn: string|null}>
      */
     private function resolveReverseInfos(Model $relatedModel, Model $parent): array
     {
@@ -366,10 +423,11 @@ class SyncRedisPivot
         /** @var Model&HasRedisCacheInterface $relatedModel */
         $prefix = $relatedModel::getRedisPrefix();
 
-        /** @var list<array{relation: string, prefix: string}> $result */
+        /** @var list<array{relation: string, prefix: string, pivotScoreColumn: string|null}> $result */
         $result = [];
         foreach ($reverseRelations as $rel) {
-            $result[] = ['relation' => $rel, 'prefix' => $prefix];
+            $pivotScoreColumn = $this->getPivotScoreColumn($relatedModel, $rel);
+            $result[] = ['relation' => $rel, 'prefix' => $prefix, 'pivotScoreColumn' => $pivotScoreColumn];
         }
 
         return $result;
@@ -378,10 +436,10 @@ class SyncRedisPivot
     /**
      * Builds index entries and pivot items for a list of IDs to attach.
      *
-     * @param  list<int|string>                                 $ids
-     * @param  array<int|string, float>                         $scores
-     * @param  list<array{relation: string, prefix: string}>    $reverseInfos
-     * @param  array<int|string, array<string, mixed>>          $pivotAttributes
+     * @param  list<int|string>                                                      $ids
+     * @param  array<int|string, float>                                              $scores
+     * @param  list<array{relation: string, prefix: string, pivotScoreColumn: string|null}>  $reverseInfos
+     * @param  array<int|string, array<string, mixed>>                               $pivotAttributes
      * @return array{array<string, array<int|string, float>>, array<string, array<string, mixed>>}
      */
     private function buildAttachEntries(
@@ -406,7 +464,13 @@ class SyncRedisPivot
 
             foreach ($reverseInfos as $ri) {
                 $reverseIndexKey = $ri['prefix'] . ':' . $id . ':' . $ri['relation'];
-                $indexEntries[$reverseIndexKey][(string) $parentId] = $parentScore;
+
+                if ($ri['pivotScoreColumn'] !== null) {
+                    $pivotVal = $pivotAttributes[$id][$ri['pivotScoreColumn']] ?? null;
+                    $indexEntries[$reverseIndexKey][(string) $parentId] = $this->scoreFromPivotValue($pivotVal);
+                } else {
+                    $indexEntries[$reverseIndexKey][(string) $parentId] = $parentScore;
+                }
             }
 
             $pivotData = array_merge(

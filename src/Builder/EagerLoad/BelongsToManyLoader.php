@@ -178,6 +178,7 @@ class BelongsToManyLoader implements EagerLoadStrategy
         foreach ($coldStartModels as $i => $coldModel) {
             $parentId  = $coldModel->getKey();
             $pivotRows = $pivotByParent->get((string) $parentId) ?? collect();
+            $pivotScoreColumn = $this->getPivotScoreColumn($coldModel, $relationName);
 
             /** @var list<Model> $orderedRelated */
             $orderedRelated = [];
@@ -196,8 +197,12 @@ class BelongsToManyLoader implements EagerLoadStrategy
                 $relModel->setRelation('pivot', $relation->newExistingPivot($pivotData));
                 $orderedRelated[] = $relModel;
 
-                $coldToCache[$relatedPrefix . ':' . $relId]                      = $relModel->getAttributes();
-                $coldIndexEntries[$modelIndexKeys[$i]][(string) $relId]          = $this->scoreFromModel($relModel);
+                $coldToCache[$relatedPrefix . ':' . $relId] = $relModel->getAttributes();
+                if ($pivotScoreColumn !== null) {
+                    $coldIndexEntries[$modelIndexKeys[$i]][(string) $relId] = $this->scoreFromPivotValue($pivotData[$pivotScoreColumn] ?? null);
+                } else {
+                    $coldIndexEntries[$modelIndexKeys[$i]][(string) $relId] = $this->scoreFromModel($relModel);
+                }
                 $coldPivotToCache[$pivotTable . ':' . $parentId . ':' . $relId] = $pivotData;
             }
 

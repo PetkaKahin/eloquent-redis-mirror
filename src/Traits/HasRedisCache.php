@@ -81,6 +81,15 @@ trait HasRedisCache
     }
 
     /**
+     * @return array<string, string>
+     */
+    public function getRedisPivotScoreColumns(): array
+    {
+        /** @var array<string, string> */
+        return $this->redisPivotScore ?? [];
+    }
+
+    /**
      * Override newModelQuery to always return a RedisBuilder, wrapping any custom builder.
      * This ensures Redis interception works even when the model defines its own newEloquentBuilder().
      *

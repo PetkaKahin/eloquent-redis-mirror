@@ -14,4 +14,12 @@ interface HasRedisCacheInterface
      * @return list<string>
      */
     public function getRedisRelations(): array;
+
+    /**
+     * Pivot columns to use as ZADD scores for BelongsToMany relations.
+     * Example: ['categories' => 'position'] — sort by pivot.position instead of model attribute.
+     *
+     * @return array<string, string>  relationName => pivotColumnName
+     */
+    public function getRedisPivotScoreColumns(): array;
 }
