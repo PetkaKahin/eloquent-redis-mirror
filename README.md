@@ -13,6 +13,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/packagist/l/petkakahin/eloquent-redis-mirror.svg" alt="License"></a>
 </p>
 
+<p align="center">
+  <b>Русская версия:</b> <a href="docs/language/ru/README.md">README (RU)</a>
+</p>
+
 ---
 
 ```php
@@ -94,8 +98,8 @@ That's it. Every model in the eager-load chain needs the trait. Eloquent API sta
 
 | | |
 |---|---|
-| **English** | [docs/en.md](docs/en.md) |
-| **Русский** | [docs/ru.md](docs/ru.md) |
+| **English** | [Documentation](docs/language/en/documentation.md) |
+| **Русский** | [Документация](docs/language/ru/documentation.md) |
 
 ## Testing
 
