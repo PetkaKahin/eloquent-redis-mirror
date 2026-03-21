@@ -2,16 +2,100 @@
 
 namespace PetkaKahin\EloquentRedisMirror\Relations;
 
+use Exception;
 use Illuminate\Contracts\Support\Arrayable;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use PetkaKahin\EloquentRedisMirror\Builder\EagerLoad\FetchesRelatedModels;
+use PetkaKahin\EloquentRedisMirror\Concerns\ResolvesRedisRelations;
+use PetkaKahin\EloquentRedisMirror\Contracts\HasRedisCacheInterface;
 use PetkaKahin\EloquentRedisMirror\Events\RedisPivotChanged;
+use PetkaKahin\EloquentRedisMirror\Repository\RedisRepository;
 
 /**
  * @extends BelongsToMany<Model, Model>
  */
 class RedisBelongsToMany extends BelongsToMany
 {
+    use FetchesRelatedModels;
+    use ResolvesRedisRelations;
+
+    protected ?RedisRepository $repositoryInstance = null;
+
+    protected function repository(): RedisRepository
+    {
+        return $this->repositoryInstance ??= app(RedisRepository::class);
+    }
+
+    /**
+     * @param list<string> $columns
+     * @return Collection<int, Model>
+     */
+    public function get($columns = ['*']): Collection
+    {
+        $parent = $this->getParent();
+
+        if (!$this->usesRedisCache($parent)) {
+            return parent::get($columns);
+        }
+
+        /** @var Model&HasRedisCacheInterface $parent */
+        $relationName = $this->getRelationName();
+
+        if (!in_array($relationName, $parent->getRedisRelations(), true)) {
+            return parent::get($columns);
+        }
+
+        $relatedModel = $this->getRelated();
+
+        if (!$this->usesRedisCache($relatedModel)) {
+            return parent::get($columns);
+        }
+
+        $baseQuery = $this->getQuery()->getQuery();
+
+        if ($baseQuery->limit !== null || $baseQuery->offset !== null) {
+            return parent::get($columns);
+        }
+
+        // BelongsToMany base adds exactly 1 where (FK constraint on pivot).
+        // Extra wheres mean user-added constraints that Redis can't evaluate.
+        if (count($baseQuery->wheres) > 1 || !empty($baseQuery->groups) || $baseQuery->distinct) {
+            return parent::get($columns);
+        }
+
+        /** @var Model&HasRedisCacheInterface $relatedModel */
+        $indexKey = $parent->getRedisIndexKey($relationName);
+        $repository = $this->repository();
+
+        try {
+            $ids = $repository->getRelationIdsChecked($indexKey);
+
+            if ($ids === null) {
+                return parent::get($columns);
+            }
+
+            if (empty($ids)) {
+                return $relatedModel->newCollection();
+            }
+
+            $relatedPrefix = $relatedModel::getRedisPrefix();
+            $pivotTable = $this->getTable();
+            /** @var int|string $parentId */
+            $parentId = $parent->getKey();
+
+            $ordered = $this->fetchRelatedWithPivots(
+                $ids, $relatedPrefix, $relatedModel,
+                $parentId, $pivotTable, $this, $repository,
+            );
+
+            return $relatedModel->newCollection($ordered);
+        } catch (Exception) {
+            return parent::get($columns);
+        }
+    }
+
     /**
      * @param mixed $id
      * @param array<string, mixed> $attributes

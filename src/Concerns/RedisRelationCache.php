@@ -14,6 +14,15 @@ final class RedisRelationCache
     /** @var array<class-string, bool> */
     public static array $traitCheck = [];
 
-    /** @var array<string, string|null> */
+    /** @var array<string, list<string>> */
     public static array $reverseRelation = [];
+
+    /**
+     * Reset all static caches. Call in test teardown to prevent cross-test pollution.
+     */
+    public static function reset(): void
+    {
+        static::$traitCheck = [];
+        static::$reverseRelation = [];
+    }
 }

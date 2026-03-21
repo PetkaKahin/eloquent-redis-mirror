@@ -12,10 +12,15 @@ use PetkaKahin\EloquentRedisMirror\Traits\HasRedisCache;
 trait ResolvesRedisRelations
 {
     /**
+     * Find ALL reverse relation names on $parent that point to $child's class.
+     * Handles the case where a parent has multiple relations to the same child model
+     * (e.g. Project has both categories() HasMany and firstCategory() HasOne to Category).
+     *
      * @param Model|class-string<Model> $parent
      * @param Model|class-string<Model> $child
+     * @return list<string>
      */
-    protected function findReverseRelationName(Model|string $parent, Model|string $child): ?string
+    protected function findAllReverseRelationNames(Model|string $parent, Model|string $child): array
     {
         $parentClass = $parent instanceof Model ? $parent::class : $parent;
         $childClass  = $child instanceof Model ? $child::class : $child;
@@ -29,11 +34,14 @@ trait ResolvesRedisRelations
         $parentInstance = $parent instanceof Model ? $parent : new $parent;
 
         if (!$this->usesRedisCache($parentInstance)) {
-            return RedisRelationCache::$reverseRelation[$cacheKey] = null;
+            return RedisRelationCache::$reverseRelation[$cacheKey] = [];
         }
 
         /** @var Model&HasRedisCacheInterface $parentInstance */
         $redisRelations = $parentInstance->getRedisRelations();
+
+        /** @var list<string> $found */
+        $found = [];
 
         foreach ($redisRelations as $relationName) {
             if (!method_exists($parentInstance, $relationName)) {
@@ -46,14 +54,14 @@ trait ResolvesRedisRelations
                 $relatedClass = $relation->getRelated()::class;
 
                 if ($relatedClass === $childClass || is_a($childClass, $relatedClass, true)) {
-                    return RedisRelationCache::$reverseRelation[$cacheKey] = $relationName;
+                    $found[] = $relationName;
                 }
             } catch (Exception) {
                 continue;
             }
         }
 
-        return RedisRelationCache::$reverseRelation[$cacheKey] = null;
+        return RedisRelationCache::$reverseRelation[$cacheKey] = $found;
     }
 
     /**
@@ -141,16 +149,27 @@ trait ResolvesRedisRelations
 
     /**
      * Convert a non-numeric string to an order-preserving float score.
-     * Maps each character's ordinal value to a positional weight so that
-     * lexicographic ordering is preserved: "aaa" < "aab" < "b".
+     *
+     * Uses big-endian packing: score = c0*256^(N-1) + c1*256^(N-2) + ... + c(N-1)
+     * This preserves lexicographic ordering: "aaa" < "aab" < "b".
+     *
+     * Precision limit: float64 mantissa = 52 bits. With base-256 (8 bits/char),
+     * we get 6 chars of exact precision (48 bits < 52). The 7th char has partial
+     * precision. Strings that share 7+ leading characters may produce equal scores.
      */
     protected function stringToScore(string $value): float
     {
+        $maxLen = 7;
+        $len = min(strlen($value), $maxLen);
         $score = 0.0;
-        $len = min(strlen($value), 8);
 
         for ($i = 0; $i < $len; $i++) {
-            $score += ord($value[$i]) / (256 ** ($i + 1));
+            $score = $score * 256.0 + ord($value[$i]);
+        }
+
+        // Pad remaining positions to ensure consistent scale
+        for ($i = $len; $i < $maxLen; $i++) {
+            $score *= 256.0;
         }
 
         return $score;

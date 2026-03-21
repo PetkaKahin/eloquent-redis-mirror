@@ -97,7 +97,7 @@ it('RedisBuilder наследует все стандартные методы E
 // ─── $redisRelations ────────────────────────────────────────
 
 it('redisRelations содержит список имён relations', function () {
-    expect((new Project())->getRedisRelations())->toBe(['categories', 'tags']);
+    expect((new Project())->getRedisRelations())->toBe(['categories', 'tags', 'firstCategory']);
 });
 
 it('redisRelations пустой массив для leaf-моделей', function () {
