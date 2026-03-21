@@ -234,14 +234,17 @@ class User extends Model
     }
 
     // Кастомный relation из стороннего пакета
+    // withRedisContext() включает Redis-перехват для exists()/count()
     public function projects(): BelongsToSortedMany
     {
-        return $this->belongsToSortedMany(Project::class, 'user_project');
+        return $this->withRedisContext('projects',
+            $this->belongsToSortedMany(Project::class, 'user_project')
+        );
     }
 }
 ```
 
-Чтение работает автоматически — и lazy load (`$user->projects`), и eager load (`User::with('projects')->find(1)`) будут обслуживаться из Redis.
+Чтение работает автоматически — и lazy load (`$user->projects`), и eager load (`User::with('projects')->find(1)`) будут обслуживаться из Redis. Метод `withRedisContext()` дополнительно включает Redis-перехват для прямых вызовов на relation-объекте (`$user->projects()->exists()`).
 
 ### Синхронизация записи
 
@@ -488,7 +491,7 @@ make tests
 make stan
 ```
 
-Покрытие: 320 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait, CustomRelation), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring, custom relation types, cold-start warm-up, exists() interception, where(id)->first() Redis cache).
+Покрытие: 324 теста — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait, CustomRelation), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring, custom relation types, cold-start warm-up, exists() interception, where(id)->first() Redis cache, withRedisContext custom exists).
 
 ---
 
