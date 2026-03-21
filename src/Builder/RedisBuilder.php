@@ -463,6 +463,16 @@ class RedisBuilder extends Builder
         static::$strategies = null;
     }
 
+    protected function getStrategyForType(string $type): ?EagerLoadStrategy
+    {
+        return match ($type) {
+            'belongsToMany' => new BelongsToManyLoader(),
+            'hasMany', 'hasOne' => new HasManyLoader(),
+            'belongsTo' => new BelongsToLoader(),
+            default => null,
+        };
+    }
+
     /**
      * @param array<int, Model> $models
      */
@@ -508,6 +518,21 @@ class RedisBuilder extends Builder
             if ($strategy->supports($relation)) {
                 $strategy->load($models, $directRelation, $relation, $nested, $constraints, $this->repository());
                 return true;
+            }
+        }
+
+        // Fallback: check if this is a custom relation with a mapped type
+        if ($firstModel instanceof HasRedisCacheInterface) {
+            $customTypes = $firstModel->getRedisCustomRelations();
+
+            if (isset($customTypes[$directRelation])) {
+                $strategy = $this->getStrategyForType($customTypes[$directRelation]);
+
+                if ($strategy !== null) {
+                    $strategy->load($models, $directRelation, $relation, $nested, $constraints, $this->repository());
+
+                    return true;
+                }
             }
         }
 

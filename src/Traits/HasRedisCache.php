@@ -9,7 +9,9 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Support\Str;
 use PetkaKahin\EloquentRedisMirror\Builder\RedisBuilder;
+use PetkaKahin\EloquentRedisMirror\Concerns\CustomRelationResolver;
 use PetkaKahin\EloquentRedisMirror\Events\RedisModelChanged;
+use PetkaKahin\EloquentRedisMirror\Events\RedisPivotChanged;
 use PetkaKahin\EloquentRedisMirror\Relations\RedisBelongsToMany;
 use RuntimeException;
 
@@ -76,8 +78,25 @@ trait HasRedisCache
      */
     public function getRedisRelations(): array
     {
-        /** @var list<string> */
-        return $this->redisRelations ?? [];
+        /** @var list<string> $standard */
+        $standard = $this->redisRelations ?? [];
+        /** @var list<string> $custom */
+        $custom = array_keys($this->redisCustomRelations ?? []);
+
+        if (empty($custom)) {
+            return $standard;
+        }
+
+        return array_values(array_unique(array_merge($standard, $custom)));
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function getRedisCustomRelations(): array
+    {
+        /** @var array<string, string> */
+        return $this->redisCustomRelations ?? [];
     }
 
     /**
@@ -192,5 +211,62 @@ trait HasRedisCache
             $relatedKey ?: $instance->getKeyName(),
             $relation
         );
+    }
+
+    /**
+     * Intercept lazy loading for custom relation methods registered in $redisCustomRelations.
+     * Tries Redis first; on miss or error falls through to the original relation (SQL).
+     *
+     * @param string $method
+     * @return mixed
+     */
+    protected function getRelationshipFromMethod($method)
+    {
+        $customRelations = $this->getRedisCustomRelations();
+
+        if (!isset($customRelations[$method])) {
+            return parent::getRelationshipFromMethod($method);
+        }
+
+        try {
+            /** @var CustomRelationResolver $resolver */
+            $resolver = app(CustomRelationResolver::class);
+            $result = $resolver->resolveFromRedis($this, $method, $customRelations[$method]);
+
+            if ($result !== false) {
+                $this->setRelation($method, $result);
+
+                return $result;
+            }
+        } catch (\Exception) {
+            // Redis unavailable — fall through to SQL
+        }
+
+        return parent::getRelationshipFromMethod($method);
+    }
+
+    /**
+     * Dispatch a RedisPivotChanged event for custom BelongsToMany relations.
+     * Call this after mutations (attach/detach/sync) on custom relation types
+     * that don't go through RedisBelongsToMany.
+     *
+     * @param string $relationName
+     * @param string $action  'attached'|'detached'|'synced'|'toggled'|'updated'
+     * @param list<int|string> $ids
+     * @param array<int|string, array<string, mixed>> $pivotAttributes
+     */
+    public function dispatchPivotChange(
+        string $relationName,
+        string $action,
+        array $ids,
+        array $pivotAttributes = [],
+    ): void {
+        event(new RedisPivotChanged(
+            $this,
+            $relationName,
+            $action,
+            $ids,
+            $pivotAttributes,
+        ));
     }
 }

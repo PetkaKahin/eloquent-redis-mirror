@@ -58,6 +58,11 @@ parameters:
         - identifier: function.alreadyNarrowedType
           path: src/Builder/EagerLoad/FetchesRelatedModels.php
 
+        # FetchesRelatedModels::loadNested() with() receives callable — PHPStan strictness on Closure vs callable
+        -
+            message: '#Parameter \#1 \$relations of method Illuminate\\Database\\Eloquent\\Builder.*::with\(\)#'
+            path: src/Builder/EagerLoad/FetchesRelatedModels.php
+
         # ResolvesRedisRelations getAttribute() returns mixed
         - identifier: cast.string
           path: src/Concerns/ResolvesRedisRelations.php

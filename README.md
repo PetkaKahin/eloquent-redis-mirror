@@ -11,6 +11,9 @@ class Project extends Model
 
     // Опционально: сортировка по pivot-колонке вместо атрибута модели
     protected array $redisPivotScore = ['tags' => 'position'];
+
+    // Опционально: кастомные relation-методы из сторонних пакетов
+    protected array $redisCustomRelations = ['sortedTags' => 'belongsToMany'];
 }
 
 // Всё работает без изменений — но данные читаются из Redis:
@@ -123,7 +126,7 @@ class Project extends Model
 }
 ```
 
-`$redisRelations` — массив имён relation-методов, для которых пакет будет хранить индексы в Redis (Sorted Set). Это позволяет `with()`, `first()` и `paginate()` через relation работать из Redis. Если модель — leaf (нет дочерних relations для кеширования), укажите пустой массив `[]`. Опциональный `$redisPivotScore` позволяет сортировать BelongsToMany по pivot-колонке — см. [Сортировка по pivot-колонке](#сортировка-по-pivot-колонке).
+`$redisRelations` — массив имён relation-методов, для которых пакет будет хранить индексы в Redis (Sorted Set). Это позволяет `with()`, `first()` и `paginate()` через relation работать из Redis. Если модель — leaf (нет дочерних relations для кеширования), укажите пустой массив `[]`. Опциональный `$redisPivotScore` позволяет сортировать BelongsToMany по pivot-колонке — см. [Сортировка по pivot-колонке](#сортировка-по-pivot-колонке). Для кастомных relation-типов из сторонних пакетов — см. [Кастомные relation-типы](#кастомные-relation-типы).
 
 ### 2. Добавьте trait к связанным моделям
 
@@ -205,6 +208,63 @@ class Project extends Model
 Поддерживаются числовые значения (`1`, `2`, `3`) и строковые (lexorank: `aaa|bbb`). Строки конвертируются в float с сохранением лексикографического порядка.
 
 При обновлении pivot (`updateExistingPivot`) score в sorted set обновляется автоматически.
+
+---
+
+## Кастомные relation-типы
+
+Сторонние пакеты часто определяют собственные relation-методы (`belongsToSortedMany`, `morphToSortedMany` и т.д.), которые возвращают кастомные классы вместо стандартных `BelongsToMany`/`HasMany`. Пакет поддерживает их кеширование через `$redisCustomRelations`:
+
+```php
+class User extends Model
+{
+    use HasRedisCache;
+
+    protected array $redisRelations = ['posts'];
+
+    // Маппинг: имя метода → базовый тип для Redis
+    // Поддерживаемые типы: 'belongsToMany', 'hasMany', 'hasOne', 'belongsTo'
+    protected array $redisCustomRelations = [
+        'projects' => 'belongsToMany',
+    ];
+
+    public function posts(): HasMany
+    {
+        return $this->hasMany(Post::class);
+    }
+
+    // Кастомный relation из стороннего пакета
+    public function projects(): BelongsToSortedMany
+    {
+        return $this->belongsToSortedMany(Project::class, 'user_project');
+    }
+}
+```
+
+Чтение работает автоматически — и lazy load (`$user->projects`), и eager load (`User::with('projects')->find(1)`) будут обслуживаться из Redis.
+
+### Синхронизация записи
+
+Стандартные relation (`hasMany`, `belongsToMany`) синхронизируются автоматически через перехват `attach()`/`detach()`/`sync()`. Кастомные relation-типы используют свои методы записи, поэтому после мутаций нужно вызвать `dispatchPivotChange()`:
+
+```php
+// Для BelongsToMany-подобных кастомных relation:
+$user->projects()->attach($projectId, ['position' => 1]);
+$user->dispatchPivotChange('projects', 'attached', [$projectId], [
+    $projectId => ['position' => 1],
+]);
+
+// Detach:
+$user->projects()->detach($projectId);
+$user->dispatchPivotChange('projects', 'detached', [$projectId]);
+
+// Sync:
+$result = $user->projects()->sync([1, 2, 3]);
+$allIds = array_merge($result['attached'], $result['detached'], $result['updated']);
+$user->dispatchPivotChange('projects', 'synced', $allIds, $pivotAttributes);
+```
+
+Поддерживаемые action: `attached`, `detached`, `synced`, `toggled`, `updated`.
 
 ---
 
@@ -401,6 +461,7 @@ src/
 ├── Relations/
 │   └── RedisBelongsToMany.php         # BelongsToMany с event dispatch
 ├── Concerns/
+│   ├── CustomRelationResolver.php     # Резолвер кастомных relation из Redis
 │   ├── RedisRelationCache.php         # Global static cache (shared)
 │   └── ResolvesRedisRelations.php     # Reverse relations, scoring
 ├── Contracts/
@@ -427,7 +488,7 @@ make tests
 make stan
 ```
 
-Покрытие: 288 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring).
+Покрытие: 296 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait, CustomRelation), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring, custom relation types).
 
 ---
 
