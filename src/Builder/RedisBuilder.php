@@ -308,7 +308,10 @@ class RedisBuilder extends Builder
         }
 
         if ($this->getQuery()->limit !== null) {
-            return parent::get($columns);
+            $result = parent::get($columns);
+            $this->cacheLoadedModels($result);
+
+            return $result;
         }
 
         // Bail if any where type is unsupported by modelSatisfiesWheres().
@@ -358,6 +361,16 @@ class RedisBuilder extends Builder
         $indexKey = $this->getRelationIndexKey();
 
         if ($indexKey === null) {
+            // Detect simple PK lookup: where('id', $value)->first()
+            // Serve from Redis cache via find() instead of hitting SQL.
+            $pkValue = $this->extractPrimaryKeyFromWheres();
+
+            if ($pkValue !== null) {
+                $found = $this->find($pkValue, $columns);
+
+                return $found instanceof Model ? $found : null;
+            }
+
             $result = parent::first($columns);
             $this->cacheSingleModel($result);
 
@@ -722,6 +735,56 @@ class RedisBuilder extends Builder
         } catch (Exception) {
             // Redis unavailable
         }
+    }
+
+    /**
+     * Extract PK value from a simple where('id', $value) clause.
+     * Returns null if query has non-PK wheres or unsupported structure.
+     *
+     * @return int|string|null
+     */
+    protected function extractPrimaryKeyFromWheres(): mixed
+    {
+        if (!$this->usesRedisCache($this->getModel())) {
+            return null;
+        }
+
+        $wheres = $this->resolveWheres();
+
+        if (empty($wheres)) {
+            return null;
+        }
+
+        $keyName = $this->getModel()->getKeyName();
+        $table = $this->getModel()->getTable();
+        $pkValue = null;
+
+        foreach ($wheres as $where) {
+            $type = $where['type'] ?? null;
+
+            if ($type === 'Basic'
+                && ($where['operator'] ?? '=') === '='
+            ) {
+                $column = $where['column'] ?? null;
+
+                if ($column === $keyName || $column === "{$table}.{$keyName}") {
+                    /** @var int|string|null $pkValue */
+                    $pkValue = $where['value'] ?? null;
+                    continue;
+                }
+            }
+
+            // SoftDeletes adds whereNull('deleted_at') — safe to ignore,
+            // modelSatisfiesWheres() in find() will handle it.
+            if ($type === 'Null') {
+                continue;
+            }
+
+            // Any other where clause — not a simple PK lookup
+            return null;
+        }
+
+        return $pkValue;
     }
 
     /**
