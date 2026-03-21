@@ -39,7 +39,7 @@ $project->categories()->paginate(15);
             └────────┬────────────┘    └────────┬────────────┘
                      │                          │
             ┌────────▼────────────┐    ┌────────▼────────────┐
-            │   RedisRepository   │    │    БД (Postgres)    │
+            │   RedisRepository   │    │    БД (БД (Postgres))    │
             │  GET/SET/ZADD/ZCARD │    │ INSERT/UPDATE/DELETE│
             └────────┬────────────┘    └────────┬────────────┘
                      │                          │ dispatch Event
@@ -59,8 +59,8 @@ $project->categories()->paginate(15);
   └─────────────────────┘
 
   READ:  Redis hit → вернуть
-         Redis miss → БД (Postgres) → записать в Redis → вернуть
-  WRITE: БД (Postgres) → model event → Listener → Redis
+         Redis miss → БД (БД (Postgres)) → записать в Redis → вернуть
+  WRITE: БД (БД (Postgres)) → model event → Listener → Redis
 ```
 
 ### Принцип хранения
@@ -253,7 +253,7 @@ class Project extends Model
 RedisBuilder::find(7)
   → Repository::get('project:7')
     → HIT:  json_decode → newFromBuilder() → вернуть модель
-    → MISS: parent::find(7) → Postgres SELECT
+    → MISS: parent::find(7) → БД (БД (Postgres)) SELECT
             → Repository::set('project:7', attributes)
             → вернуть модель
 ```
@@ -283,7 +283,7 @@ Project::with('tags')->find(7)
 ### WRITE — `$project->update([...])`
 
 ```
-Eloquent save → Postgres UPDATE
+Eloquent save → БД (Postgres) UPDATE
   → bootHasRedisCache (updated hook) → event(RedisModelChanged($project, 'updated', ['name']))
     → SyncRedisHash::handle()
       → Repository::set('project:7', attributes)
@@ -293,7 +293,7 @@ Eloquent save → Postgres UPDATE
 
 ```
 $task->update(['category_id' => 2])  // было 1
-  → Postgres UPDATE
+  → БД (Postgres) UPDATE
   → bootHasRedisCache (updated hook) → SyncRedisHash::handle()
     → Repository::set('task:15', attributes)
     → Repository::removeFromIndex('category:1:tasks', 15)
@@ -304,7 +304,7 @@ $task->update(['category_id' => 2])  // было 1
 
 ```
 $project->tags()->attach([5, 8], ['role' => 'primary'])
-  → Postgres INSERT в pivot
+  → БД (Postgres) INSERT в pivot
   → RedisBelongsToMany dispatch event → SyncRedisPivot::handle()
     → Repository::addToIndex('project:7:tags', 5, $score)
     → Repository::addToIndex('tag:5:projects', 7, $score)  // обратный индекс
@@ -332,19 +332,19 @@ Warmed-флаги имеют TTL 24 часа. При истечении — ав
 
 | Метод | Поведение |
 |-------|-----------|
-| `find($id)` | Redis → hit + проверка WHERE/scopes → miss: Postgres → записать в Redis |
+| `find($id)` | Redis → hit + проверка WHERE/scopes → miss: БД (Postgres) → записать в Redis |
 | `findMany($ids)` | Pipeline GET → проверка WHERE/scopes → промахи одним WHERE IN → Pipeline SET |
 | `with('relation')` | ZRANGE из индекса → findMany по ID |
 | `first()` через relation | ZRANGE 0 0 → find по ID |
 | `paginate()` через relation | ZCARD + ZRANGE LIMIT → findMany → LengthAwarePaginator |
 
-### Не перехватывается (Postgres)
+### Не перехватывается (БД (Postgres))
 
 | Метод | Причина |
 |-------|---------|
 | `where()`, `orderBy()`, `groupBy()` | Фильтрация и сортировка не кешируются |
 | `count()`, `sum()`, `avg()` | Агрегации всегда в БД |
-| `Model::first()`, `Model::get()` | Без relation-контекста идут в Postgres |
+| `Model::first()`, `Model::get()` | Без relation-контекста идут в БД (Postgres) |
 | `Model::all()` | Не перехватывается |
 | `insert()`, `join()`, `raw()` | Сложные запросы идут напрямую в БД |
 
@@ -354,11 +354,11 @@ Warmed-флаги имеют TTL 24 часа. При истечении — ав
 
 ### Cold start
 
-При пустом Redis первый запрос идёт в Postgres, результат автоматически записывается в Redis. Прогрев lazy — по мере обращений.
+При пустом Redis первый запрос идёт в БД (Postgres), результат автоматически записывается в Redis. Прогрев lazy — по мере обращений.
 
 ### Redis недоступен
 
-Все операции fallback на Postgres через стандартный Eloquent. WRITE-операции записывают в Postgres, listener ловит исключение Redis и логирует. При восстановлении Redis — данные прогреются через cold start.
+Все операции fallback на БД (Postgres) через стандартный Eloquent. WRITE-операции записывают в БД (Postgres), listener ловит исключение Redis и логирует. При восстановлении Redis — данные прогреются через cold start.
 
 ### Атомарность записи в Redis
 
@@ -366,7 +366,7 @@ Batch-операции (`executeBatch`) используют `MULTI/EXEC` — а
 
 ### Race conditions
 
-Два параллельных обновления одной записи: оба пишут в Postgres (разруливается транзакциями), оба кидают event, второй listener перезапишет Redis. Итог корректный — last-write-wins, source of truth всегда Postgres.
+Два параллельных обновления одной записи: оба пишут в БД (Postgres) (разруливается транзакциями), оба кидают event, второй listener перезапишет Redis. Итог корректный — last-write-wins, source of truth всегда БД (Postgres).
 
 ### SoftDeletes
 
