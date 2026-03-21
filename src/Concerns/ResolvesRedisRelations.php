@@ -79,6 +79,53 @@ trait ResolvesRedisRelations
     }
 
     /**
+     * Get the pivot score column for a relation, if configured.
+     *
+     * @param Model&HasRedisCacheInterface $parent
+     */
+    protected function getPivotScoreColumn(Model $parent, string $relationName): ?string
+    {
+        $columns = $parent->getRedisPivotScoreColumns();
+
+        return $columns[$relationName] ?? null;
+    }
+
+    /**
+     * Convert a raw pivot column value to a float score.
+     */
+    protected function scoreFromPivotValue(mixed $value): float
+    {
+        if ($value === null) {
+            return (float) time();
+        }
+
+        if (is_numeric($value)) {
+            return (float) $value;
+        }
+
+        return $this->stringToScore((string) $value);
+    }
+
+    /**
+     * Build scores from pivot attributes for a list of IDs.
+     *
+     * @param list<int|string> $ids
+     * @param array<int|string, array<string, mixed>> $pivotAttributes
+     * @return array<int|string, float>
+     */
+    protected function scoresFromPivotAttributes(array $ids, string $pivotScoreColumn, array $pivotAttributes): array
+    {
+        /** @var array<int|string, float> $scores */
+        $scores = [];
+
+        foreach ($ids as $id) {
+            $scores[$id] = $this->scoreFromPivotValue($pivotAttributes[$id][$pivotScoreColumn] ?? null);
+        }
+
+        return $scores;
+    }
+
+    /**
      * Get the sort score from a model instance.
      * Supports custom score via getRedisSortScore() method or getRedisSortField() method on the model.
      */

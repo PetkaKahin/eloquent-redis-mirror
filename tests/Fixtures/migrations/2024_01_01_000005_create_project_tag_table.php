@@ -13,6 +13,7 @@ return new class extends Migration
             $table->foreignId('project_id')->constrained()->cascadeOnDelete();
             $table->foreignId('tag_id')->constrained()->cascadeOnDelete();
             $table->string('role')->nullable();
+            $table->integer('position')->nullable();
             $table->timestamps();
         });
     }
