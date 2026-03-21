@@ -488,7 +488,7 @@ make tests
 make stan
 ```
 
-Покрытие: 296 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait, CustomRelation), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring, custom relation types).
+Покрытие: 305 тестов — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait, CustomRelation), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring, custom relation types, cold-start warm-up).
 
 ---
 
