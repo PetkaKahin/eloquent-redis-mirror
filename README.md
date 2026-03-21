@@ -8,20 +8,30 @@ class Project extends Model
     use HasRedisCache;
 
     protected array $redisRelations = ['categories', 'tags'];
-
-    // Опционально: сортировка по pivot-колонке вместо атрибута модели
-    protected array $redisPivotScore = ['tags' => 'position'];
-
-    // Опционально: кастомные relation-методы из сторонних пакетов
-    protected array $redisCustomRelations = ['sortedTags' => 'belongsToMany'];
 }
 
 // Всё работает без изменений — но данные читаются из Redis:
-Project::find(7);
-Project::with('categories.tasks')->find(7);
-$project->tags()->attach([5, 8], ['role' => 'primary', 'position' => 1]);
-$project->categories()->paginate(15);
+Project::find(7);                                          // Redis GET
+Project::with('categories.tasks')->find(7);                // Redis ZRANGE + pipeline GET
+$project->categories()->paginate(15);                      // Redis ZCARD + ZRANGE
+$project->categories()->exists();                          // Redis ZCARD
+$project->tags()->attach([5, 8], ['role' => 'primary']);   // БД + автосинхронизация Redis
 ```
+
+---
+
+## Содержание
+
+- [Как это работает](#как-это-работает)
+- [Требования](#требования)
+- [Установка](#установка)
+- [Быстрый старт](#быстрый-старт)
+- [Конфигурация модели](#конфигурация-модели)
+- [Кастомные relation-типы](#кастомные-relation-типы)
+- [Что перехватывается, а что нет](#что-перехватывается-а-что-нет)
+- [Edge cases](#edge-cases)
+- [Архитектура](#архитектура)
+- [Тестирование](#тестирование)
 
 ---
 
@@ -62,8 +72,8 @@ $project->categories()->paginate(15);
   └─────────────────────┘
 
   READ:  Redis hit → вернуть
-         Redis miss → БД (Postgres) → записать в Redis → вернуть
-  WRITE: БД (Postgres) → model event → Listener → Redis
+         Redis miss → БД → записать в Redis → вернуть
+  WRITE: БД → model event → Listener → Redis
 ```
 
 ### Принцип хранения
@@ -126,8 +136,6 @@ class Project extends Model
 }
 ```
 
-`$redisRelations` — массив имён relation-методов, для которых пакет будет хранить индексы в Redis (Sorted Set). Это позволяет `with()`, `first()` и `paginate()` через relation работать из Redis. Если модель — leaf (нет дочерних relations для кеширования), укажите пустой массив `[]`. Опциональный `$redisPivotScore` позволяет сортировать BelongsToMany по pivot-колонке — см. [Сортировка по pivot-колонке](#сортировка-по-pivot-колонке). Для кастомных relation-типов из сторонних пакетов — см. [Кастомные relation-типы](#кастомные-relation-типы).
-
 ### 2. Добавьте trait к связанным моделям
 
 Каждая модель в цепочке eager loading должна подключать trait:
@@ -149,14 +157,13 @@ class Task extends Model
 {
     use HasRedisCache;
 
-    protected array $redisRelations = [];
-    // Leaf-модель: trait кеширует саму запись
+    protected array $redisRelations = []; // Leaf-модель: trait кеширует саму запись
 }
 ```
 
 ### 3. Готово
 
-Eloquent API не меняется. Всё работает как раньше:
+Eloquent API не меняется:
 
 ```php
 // READ — из Redis (с автоматическим fallback в БД)
@@ -165,8 +172,12 @@ $project = Project::with('categories.tasks')->find(7);
 $projects = Project::findMany([1, 2, 3]);
 
 // Relation-контекст — тоже из Redis
-$first = $project->categories()->first();
-$page  = $project->categories()->paginate(15);
+$first  = $project->categories()->first();
+$page   = $project->categories()->paginate(15);
+$exists = $project->categories()->exists();
+
+// Auth provider: where('id', $id)->first() тоже из Redis
+$user = User::where('id', $id)->first();
 
 // WRITE — в БД + автосинхронизация Redis
 $project->update(['name' => 'Новое имя']);
@@ -178,42 +189,52 @@ $project->tags()->detach(5);
 
 ---
 
-## Сортировка по pivot-колонке
+## Конфигурация модели
 
-По умолчанию sorted set индексы используют атрибуты связанной модели для score (например, `created_at`). Если порядок определяется pivot-колонкой (как `position` в `BelongsToSortedMany` из lexorank-sortable), добавьте `$redisPivotScore`:
+### `$redisRelations`
+
+Массив имён relation-методов, для которых пакет хранит Sorted Set индексы в Redis. Это позволяет `with()`, `first()`, `paginate()` и `exists()` через relation работать из Redis.
 
 ```php
-class Project extends Model
-{
-    use HasRedisCache;
-
-    protected array $redisRelations = ['tags'];
-
-    // Ключ — имя relation, значение — колонка в pivot-таблице
-    protected array $redisPivotScore = [
-        'tags' => 'position',
-    ];
-
-    public function tags(): BelongsToMany
-    {
-        return $this->belongsToMany(Tag::class);
-    }
-}
+protected array $redisRelations = ['categories', 'tags', 'firstCategory'];
 ```
 
-`ZADD project:7:tags` использует `pivot.position` как score вместо `tag.created_at`. Каждый проект хранит свой порядок тегов.
+Если модель — leaf (нет дочерних relations для кеширования), укажите пустой массив `[]`.
 
-Конфигурация — per-direction: `Project` сортирует теги по `position`, а `Tag` — проекты по `created_at` (или по своей pivot-колонке).
+### `$redisPivotScore`
 
-Поддерживаются числовые значения (`1`, `2`, `3`) и строковые (lexorank: `aaa|bbb`). Строки конвертируются в float с сохранением лексикографического порядка.
+По умолчанию sorted set индексы используют атрибуты связанной модели для score (например, `created_at`). Если порядок определяется pivot-колонкой (как `position` в `BelongsToSortedMany`), добавьте `$redisPivotScore`:
 
-При обновлении pivot (`updateExistingPivot`) score в sorted set обновляется автоматически.
+```php
+protected array $redisPivotScore = [
+    'tags' => 'position', // ключ — имя relation, значение — колонка в pivot-таблице
+];
+```
+
+`ZADD project:7:tags` использует `pivot.position` как score вместо `tag.created_at`. Поддерживаются числовые значения и строковые (lexorank: `aaa|bbb`). При `updateExistingPivot` score обновляется автоматически.
+
+### `$redisCustomRelations`
+
+Маппинг кастомных relation-методов из сторонних пакетов на базовые типы для Redis. Подробнее — в разделе [Кастомные relation-типы](#кастомные-relation-типы).
+
+```php
+protected array $redisCustomRelations = [
+    'projects' => 'belongsToMany', // belongsToSortedMany() из стороннего пакета
+];
+```
 
 ---
 
 ## Кастомные relation-типы
 
-Сторонние пакеты часто определяют собственные relation-методы (`belongsToSortedMany`, `morphToSortedMany` и т.д.), которые возвращают кастомные классы вместо стандартных `BelongsToMany`/`HasMany`. Пакет поддерживает их кеширование через `$redisCustomRelations`:
+Сторонние пакеты часто определяют собственные relation-методы (`belongsToSortedMany`, `morphToSortedMany` и т.д.), которые возвращают кастомные классы вместо стандартных `BelongsToMany`/`HasMany`. Такие relation обходят перехват пакета, потому что:
+
+- `belongsToSortedMany()` создаёт `BelongsToSortedMany` напрямую, минуя `HasRedisCache::belongsToMany()` (который возвращает `RedisBelongsToMany`)
+- Внутренний builder relation не получает relation context для Redis
+
+Пакет поддерживает кеширование кастомных relation через три механизма:
+
+### Шаг 1: `$redisCustomRelations` — маппинг типов
 
 ```php
 class User extends Model
@@ -227,14 +248,18 @@ class User extends Model
     protected array $redisCustomRelations = [
         'projects' => 'belongsToMany',
     ];
+```
 
-    public function posts(): HasMany
-    {
-        return $this->hasMany(Post::class);
-    }
+Это включает:
+- **Lazy load** (`$user->projects`) — обслуживается из Redis через `CustomRelationResolver`
+- **Eager load** (`User::with('projects')->find(1)`) — обслуживается из Redis через стратегию eager loading
 
-    // Кастомный relation из стороннего пакета
-    // withRedisContext() включает Redis-перехват для exists()/count()
+### Шаг 2: `withRedisContext()` — перехват exists()/count()
+
+Lazy load и eager load работают автоматически после шага 1. Но прямые вызовы методов на relation-объекте (`$user->projects()->exists()`) требуют, чтобы внутренний builder знал о relation context. Для этого оберните return relation-метода в `withRedisContext()`:
+
+```php
+    // В модели User:
     public function projects(): BelongsToSortedMany
     {
         return $this->withRedisContext('projects',
@@ -244,14 +269,16 @@ class User extends Model
 }
 ```
 
-Чтение работает автоматически — и lazy load (`$user->projects`), и eager load (`User::with('projects')->find(1)`) будут обслуживаться из Redis. Метод `withRedisContext()` дополнительно включает Redis-перехват для прямых вызовов на relation-объекте (`$user->projects()->exists()`).
+**Что это даёт:** `$user->projects()->exists()` проверяет ZCARD в Redis вместо SQL. При наличии дополнительных constraint (например `wherePivot`) — автоматический fallback в SQL.
 
-### Синхронизация записи
+**Когда нужно:** если вы вызываете методы на relation-объекте (`->exists()`, `->count()`). Если используете только lazy load (`$user->projects`) или eager load (`with('projects')`), `withRedisContext` не обязателен.
 
-Стандартные relation (`hasMany`, `belongsToMany`) синхронизируются автоматически через перехват `attach()`/`detach()`/`sync()`. Кастомные relation-типы используют свои методы записи, поэтому после мутаций нужно вызвать `dispatchPivotChange()`:
+### Шаг 3: `dispatchPivotChange()` — синхронизация записи
+
+Стандартные `hasMany`/`belongsToMany` синхронизируются автоматически через перехват `attach()`/`detach()`/`sync()`. Кастомные relation используют свои методы записи, поэтому после мутаций вызовите `dispatchPivotChange()`:
 
 ```php
-// Для BelongsToMany-подобных кастомных relation:
+// Attach:
 $user->projects()->attach($projectId, ['position' => 1]);
 $user->dispatchPivotChange('projects', 'attached', [$projectId], [
     $projectId => ['position' => 1],
@@ -269,6 +296,117 @@ $user->dispatchPivotChange('projects', 'synced', $allIds, $pivotAttributes);
 
 Поддерживаемые action: `attached`, `detached`, `synced`, `toggled`, `updated`.
 
+### Полный пример кастомного relation
+
+```php
+use PetkaKahin\EloquentRedisMirror\Traits\HasRedisCache;
+
+class User extends Model
+{
+    use HasRedisCache;
+
+    protected array $redisRelations = ['posts'];
+
+    protected array $redisCustomRelations = [
+        'projects' => 'belongsToMany',
+    ];
+
+    // Опционально: сортировка по pivot-колонке
+    protected array $redisPivotScore = [
+        'projects' => 'position',
+    ];
+
+    public function posts(): HasMany
+    {
+        return $this->hasMany(Post::class);
+    }
+
+    // Кастомный relation из стороннего пакета
+    public function projects(): BelongsToSortedMany
+    {
+        return $this->withRedisContext('projects',
+            $this->belongsToSortedMany(Project::class, 'user_project')
+        );
+    }
+}
+
+// Чтение — всё из Redis:
+$user->projects;                          // lazy load из Redis
+User::with('projects')->find(1);          // eager load из Redis
+$user->projects()->exists();              // ZCARD из Redis
+
+// Запись — БД + ручная синхронизация Redis:
+$user->projects()->attach($id);
+$user->dispatchPivotChange('projects', 'attached', [$id]);
+```
+
+---
+
+## Что перехватывается, а что нет
+
+### Перехватывается (Redis)
+
+| Метод | Поведение |
+|-------|-----------|
+| `find($id)` | Redis GET → проверка WHERE/scopes → miss: БД → SET |
+| `findMany($ids)` | Pipeline GET → miss: WHERE IN → Pipeline SET |
+| `where('id', $id)->first()` | Детект PK-запроса → `find()` через Redis |
+| `with('relation')` | ZRANGE индекса → findMany |
+| `$relation->first()` | ZRANGE 0 0 → find |
+| `$relation->paginate()` | ZCARD + ZRANGE LIMIT → findMany |
+| `$relation->exists()` | ZCARD > 0 (HasMany, BelongsToMany, кастомные с `withRedisContext`) |
+| `$relation->get()` | ZRANGE → findMany (без limit/offset) |
+
+### Не перехватывается (БД)
+
+| Метод | Причина |
+|-------|---------|
+| `where('name', ...)->get()` | Фильтрация не по PK — Redis не может оценить |
+| `orderBy()`, `groupBy()` | Сортировка/группировка не кешируется |
+| `count()`, `sum()`, `avg()` | Агрегации всегда в БД |
+| `Model::all()`, `Model::get()` | Без relation-контекста и PK — БД |
+| `$relation->exists()` с `wherePivot` | Дополнительные constraint — fallback в SQL |
+| `insert()`, `join()`, `raw()` | Сложные запросы идут напрямую в БД |
+| `DB::table()->...` | Raw query builder — не проходит через Eloquent events |
+
+### Cold start
+
+При пустом Redis (или истёкшем warmed-флаге) первый запрос идёт в БД. Результат автоматически записывается в Redis и помечается warmed-флагом (TTL 24 часа). Прогрев lazy — по мере обращений.
+
+Это работает на всех уровнях:
+- `find()` / `findMany()` — модель кешируется при первом промахе
+- `where('id', $id)->first()` — модель кешируется через `find()`
+- `$relation->get()` / `first()` — индекс + модели прогреваются при cold start
+- Кастомные relation через `$redisCustomRelations` — прогрев через `CustomRelationResolver`
+
+---
+
+## Edge cases
+
+### Redis недоступен
+
+Все операции fallback на БД через стандартный Eloquent. WRITE-операции записывают в БД, listener ловит исключение Redis и логирует. При восстановлении Redis — данные прогреются через cold start.
+
+### Атомарность записи в Redis
+
+Batch-операции (`executeBatch`) используют `MULTI/EXEC` — атомарную транзакцию Redis. Если Redis упадёт mid-write, ни одна команда из батча не выполнится.
+
+### Race conditions
+
+Два параллельных обновления одной записи: оба пишут в БД (разруливается транзакциями), оба кидают event, второй listener перезапишет Redis. Итог корректный — last-write-wins, source of truth всегда БД.
+
+### SoftDeletes
+
+Модели с `SoftDeletes` полностью поддерживаются. `find()` проверяет `deleted_at` из Redis-кеша через global scopes. `restored` event синхронизирует восстановленную запись обратно в Redis.
+
+### Оптимизация score-пересчёта
+
+При обновлении модели ZADD выполняется только если sort score реально изменился. Для моделей с `getRedisSortScore()` пакет сравнивает текущий и предыдущий score.
+
+### Только Eloquent-операции
+
+`DB::table()->insert()`, raw SQL и query builder без моделей **не перехватываются** — Redis не узнает об изменениях. Синхронизация работает только через Eloquent model events.
+
 ---
 
 ## Архитектура
@@ -281,7 +419,7 @@ $user->dispatchPivotChange('projects', 'synced', $allIds, $pivotAttributes);
 │  Конфигурация модели, подмена Builder, подмена relations    │
 ├─────────────────────────────────────────────────────────────┤
 │  Слой 2: RedisBuilder                                       │
-│  Перехват find/findMany/with/first/paginate                 │
+│  Перехват find/findMany/with/first/paginate/exists          │
 │  При WRITE — Builder не участвует. Eloquent model events    │
 │  (bootHasRedisCache) кидают event → Listener → Redis        │
 ├─────────────────────────────────────────────────────────────┤
@@ -303,25 +441,23 @@ $user->dispatchPivotChange('projects', 'synced', $allIds, $pivotAttributes);
 - **RedisBuilder** читает Redis только через RedisRepository
 - **Listeners** работают с Redis только через RedisRepository
 - **RedisRepository** не знает про Eloquent — принимает `string`/`array`/`int`
-- **RedisRepository::executeBatch()** использует `MULTI/EXEC` — атомарная транзакция, при сбое Redis partial writes невозможны
+- **RedisRepository::executeBatch()** использует `MULTI/EXEC` — атомарная транзакция
 - **HasRedisCache** trait не содержит логики кеширования — только конфигурация
 
----
+### Поток данных
 
-## Поток данных
-
-### READ — `Project::find(7)`
+#### READ — `Project::find(7)`
 
 ```
 RedisBuilder::find(7)
   → Repository::get('project:7')
     → HIT:  json_decode → newFromBuilder() → вернуть модель
-    → MISS: parent::find(7) → БД (Postgres) SELECT
+    → MISS: parent::find(7) → БД SELECT
             → Repository::set('project:7', attributes)
             → вернуть модель
 ```
 
-### READ — `Project::with('categories.tasks')->find(7)`
+#### READ — `Project::with('categories.tasks')->find(7)`
 
 ```
 RedisBuilder::find(7)                                        // project из Redis
@@ -333,7 +469,7 @@ RedisBuilder::find(7)                                        // project из Red
         → Repository::getMany(['task:10', 'task:11'])        // pipeline GET
 ```
 
-### READ — BelongsToMany с pivot
+#### READ — BelongsToMany с pivot
 
 ```
 Project::with('tags')->find(7)
@@ -343,40 +479,37 @@ Project::with('tags')->find(7)
   → Собрать $tag->pivot
 ```
 
-### WRITE — `$project->update([...])`
+#### WRITE — `$project->update([...])`
 
 ```
-Eloquent save → БД (Postgres) UPDATE
-  → bootHasRedisCache (updated hook) → event(RedisModelChanged($project, 'updated', ['name']))
+Eloquent save → БД UPDATE
+  → bootHasRedisCache (updated hook) → event(RedisModelChanged)
     → SyncRedisHash::handle()
       → Repository::set('project:7', attributes)
 ```
 
-### WRITE — изменение FK
+#### WRITE — изменение FK
 
 ```
 $task->update(['category_id' => 2])  // было 1
-  → БД (Postgres) UPDATE
-  → bootHasRedisCache (updated hook) → SyncRedisHash::handle()
+  → БД UPDATE → SyncRedisHash::handle()
     → Repository::set('task:15', attributes)
     → Repository::removeFromIndex('category:1:tasks', 15)
     → Repository::addToIndex('category:2:tasks', 15, $score)
 ```
 
-### WRITE — pivot
+#### WRITE — pivot
 
 ```
 $project->tags()->attach([5, 8], ['role' => 'primary'])
-  → БД (Postgres) INSERT в pivot
-  → RedisBelongsToMany dispatch event → SyncRedisPivot::handle()
+  → БД INSERT в pivot
+  → RedisBelongsToMany dispatch → SyncRedisPivot::handle()
     → Repository::addToIndex('project:7:tags', 5, $score)
     → Repository::addToIndex('tag:5:projects', 7, $score)  // обратный индекс
     → Repository::set('project_tag:7:5', {pivot attrs})
 ```
 
----
-
-## Формат ключей Redis
+### Формат ключей Redis
 
 | Тип | Формат | Пример |
 |-----|--------|--------|
@@ -387,65 +520,7 @@ $project->tags()->attach([5, 8], ['role' => 'primary'])
 
 Warmed-флаги имеют TTL 24 часа. При истечении — автоматический cold-start из БД (без потери данных).
 
----
-
-## Что перехватывается, а что нет
-
-### Перехватывается (Redis)
-
-| Метод | Поведение |
-|-------|-----------|
-| `find($id)` | Redis → hit + проверка WHERE/scopes → miss: БД (Postgres) → записать в Redis |
-| `findMany($ids)` | Pipeline GET → проверка WHERE/scopes → промахи одним WHERE IN → Pipeline SET |
-| `with('relation')` | ZRANGE из индекса → findMany по ID |
-| `first()` через relation | ZRANGE 0 0 → find по ID |
-| `paginate()` через relation | ZCARD + ZRANGE LIMIT → findMany → LengthAwarePaginator |
-
-### Не перехватывается (БД (Postgres))
-
-| Метод | Причина |
-|-------|---------|
-| `where()`, `orderBy()`, `groupBy()` | Фильтрация и сортировка не кешируются |
-| `count()`, `sum()`, `avg()` | Агрегации всегда в БД |
-| `Model::first()`, `Model::get()` | Без relation-контекста идут в БД (Postgres) |
-| `Model::all()` | Не перехватывается |
-| `insert()`, `join()`, `raw()` | Сложные запросы идут напрямую в БД |
-
----
-
-## Edge cases
-
-### Cold start
-
-При пустом Redis первый запрос идёт в БД (Postgres), результат автоматически записывается в Redis. Прогрев lazy — по мере обращений.
-
-### Redis недоступен
-
-Все операции fallback на БД (Postgres) через стандартный Eloquent. WRITE-операции записывают в БД (Postgres), listener ловит исключение Redis и логирует. При восстановлении Redis — данные прогреются через cold start.
-
-### Атомарность записи в Redis
-
-Batch-операции (`executeBatch`) используют `MULTI/EXEC` — атомарную транзакцию Redis. Если Redis упадёт mid-write, ни одна команда из батча не выполнится. Partial state (модель обновлена, но индекс нет) невозможен.
-
-### Race conditions
-
-Два параллельных обновления одной записи: оба пишут в БД (Postgres) (разруливается транзакциями), оба кидают event, второй listener перезапишет Redis. Итог корректный — last-write-wins, source of truth всегда БД (Postgres).
-
-### SoftDeletes
-
-Модели с `SoftDeletes` полностью поддерживаются. `find()` корректно проверяет `deleted_at` из Redis-кеша через global scopes. `restored` event синхронизирует восстановленную запись обратно в Redis.
-
-### Оптимизация score-пересчёта
-
-При обновлении модели ZADD для индексов выполняется только если sort score реально изменился. Для моделей с `getRedisSortScore()` пакет сравнивает текущий и предыдущий score — лишних ZADD нет.
-
-### Только Eloquent-операции
-
-`DB::table()->insert()`, raw SQL и query builder без моделей **не перехватываются** — Redis не узнает об изменениях. Синхронизация работает только через Eloquent model events.
-
----
-
-## Структура пакета
+### Структура пакета
 
 ```
 src/
@@ -491,7 +566,7 @@ make tests
 make stan
 ```
 
-Покрытие: 324 теста — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait, CustomRelation), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity, pivot scoring, custom relation types, cold-start warm-up, exists() interception, where(id)->first() Redis cache, withRedisContext custom exists).
+Покрытие: 324 теста — unit, integration, feature, regression.
 
 ---
 
