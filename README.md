@@ -39,7 +39,7 @@ $project->categories()->paginate(15);
             └────────┬────────────┘    └────────┬────────────┘
                      │                          │
             ┌────────▼────────────┐    ┌────────▼────────────┐
-            │   RedisRepository   │    │    БД (БД (Postgres))    │
+            │   RedisRepository   │    │    БД (Postgres)    │
             │  GET/SET/ZADD/ZCARD │    │ INSERT/UPDATE/DELETE│
             └────────┬────────────┘    └────────┬────────────┘
                      │                          │ dispatch Event
@@ -59,8 +59,8 @@ $project->categories()->paginate(15);
   └─────────────────────┘
 
   READ:  Redis hit → вернуть
-         Redis miss → БД (БД (Postgres)) → записать в Redis → вернуть
-  WRITE: БД (БД (Postgres)) → model event → Listener → Redis
+         Redis miss → БД (Postgres) → записать в Redis → вернуть
+  WRITE: БД (Postgres) → model event → Listener → Redis
 ```
 
 ### Принцип хранения
@@ -253,7 +253,7 @@ class Project extends Model
 RedisBuilder::find(7)
   → Repository::get('project:7')
     → HIT:  json_decode → newFromBuilder() → вернуть модель
-    → MISS: parent::find(7) → БД (БД (Postgres)) SELECT
+    → MISS: parent::find(7) → БД (Postgres) SELECT
             → Repository::set('project:7', attributes)
             → вернуть модель
 ```
