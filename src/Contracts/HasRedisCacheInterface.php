@@ -22,4 +22,12 @@ interface HasRedisCacheInterface
      * @return array<string, string>  relationName => pivotColumnName
      */
     public function getRedisPivotScoreColumns(): array;
+
+    /**
+     * Custom relation methods mapped to their base Redis type.
+     * Example: ['projects' => 'belongsToMany'] — treat custom belongsToSortedMany() as BelongsToMany for Redis.
+     *
+     * @return array<string, string>  relationName => baseType ('belongsToMany'|'hasMany'|'hasOne'|'belongsTo')
+     */
+    public function getRedisCustomRelations(): array;
 }
