@@ -28,9 +28,7 @@ trait HasRedisCache
 
         static::updated(static function (Model $model): void {
             /** @var array<int, string> $dirty */
-            $dirty           = array_keys($model->getChanges());
-            $updatedAtColumn = $model->getUpdatedAtColumn();
-            $dirty           = array_values(array_diff($dirty, [$updatedAtColumn]));
+            $dirty = array_keys($model->getChanges());
 
             event(new RedisModelChanged($model, 'updated', $dirty));
         });

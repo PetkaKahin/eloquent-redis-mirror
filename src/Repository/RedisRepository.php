@@ -84,9 +84,17 @@ class RedisRepository
             return;
         }
 
-        Redis::pipeline(static function ($pipe) use ($items): void { // @phpstan-ignore-line
-            foreach ($items as $key => $attributes) {
-                $pipe->set($key, json_encode($attributes, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+        // Pre-encode all values before entering the pipeline to avoid
+        // partial writes if json_encode throws mid-pipeline.
+        /** @var array<string, string> $encoded */
+        $encoded = [];
+        foreach ($items as $key => $attributes) {
+            $encoded[$key] = json_encode($attributes, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        }
+
+        Redis::pipeline(static function ($pipe) use ($encoded): void { // @phpstan-ignore-line
+            foreach ($encoded as $key => $json) {
+                $pipe->set($key, $json);
             }
         });
     }
@@ -281,9 +289,17 @@ class RedisRepository
             return;
         }
 
-        Redis::pipeline(static function ($pipe) use ($setItems, $deleteKeys, $addToIndices, $removeFromIndices, $markWarmed): void { // @phpstan-ignore-line
-            foreach ($setItems as $key => $attributes) {
-                $pipe->set($key, json_encode($attributes, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+        // Pre-encode all JSON values before entering the pipeline to avoid
+        // partial writes if json_encode throws mid-pipeline.
+        /** @var array<string, string> $encodedItems */
+        $encodedItems = [];
+        foreach ($setItems as $key => $attributes) {
+            $encodedItems[$key] = json_encode($attributes, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        }
+
+        Redis::pipeline(static function ($pipe) use ($encodedItems, $deleteKeys, $addToIndices, $removeFromIndices, $markWarmed): void { // @phpstan-ignore-line
+            foreach ($encodedItems as $key => $json) {
+                $pipe->set($key, $json);
             }
 
             if (!empty($deleteKeys)) {

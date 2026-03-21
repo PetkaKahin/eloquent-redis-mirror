@@ -28,19 +28,39 @@ parameters:
           path: src/Listeners/SyncRedisPivot.php
 
 
-        # Dynamic relation calls return mixed
-        - message: '#Cannot call method get\(\) on mixed#'
-          path: src/Builder/RedisBuilder.php
-
         # parent::sync/toggle return types are loosely typed in Laravel
         - identifier: return.type
           path: src/Relations/RedisBelongsToMany.php
         - identifier: argument.type
           path: src/Relations/RedisBelongsToMany.php
 
+        # Eloquent Model::getKey() returns mixed — used in string ops in EagerLoad
+        - identifier: binaryOp.invalid
+          path: src/Builder/EagerLoad/BelongsToManyLoader.php
+        - identifier: cast.string
+          path: src/Builder/EagerLoad/BelongsToManyLoader.php
+        - identifier: binaryOp.invalid
+          path: src/Builder/EagerLoad/HasManyLoader.php
+        - identifier: cast.string
+          path: src/Builder/EagerLoad/HasManyLoader.php
+        - identifier: cast.string
+          path: src/Builder/EagerLoad/FetchesRelatedModels.php
+
+        # array_unique expects string-castable, Model::getKey() returns mixed
+        - identifier: argument.type
+          path: src/Builder/EagerLoad/BelongsToLoader.php
+        - identifier: argument.type
+          path: src/Builder/EagerLoad/BelongsToManyLoader.php
+        - identifier: argument.type
+          path: src/Builder/EagerLoad/HasManyLoader.php
+
+        # method_exists check is always true per PHPDoc but keeps runtime safety
+        - identifier: function.alreadyNarrowedType
+          path: src/Builder/EagerLoad/FetchesRelatedModels.php
+
+        # ResolvesRedisRelations getAttribute() returns mixed
+        - identifier: cast.string
+          path: src/Concerns/ResolvesRedisRelations.php
+
         # array_values on a known list is harmless
         - identifier: arrayValues.list
-
-        # loadRedisRelation array key type mismatch (int vs int|string)
-        - message: '#loadRedisRelation\(\) expects array<int#'
-          path: src/Builder/RedisBuilder.php

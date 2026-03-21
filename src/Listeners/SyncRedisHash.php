@@ -5,6 +5,8 @@ namespace PetkaKahin\EloquentRedisMirror\Listeners;
 use Exception;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Support\Facades\DB;
 use JsonException;
 use PetkaKahin\EloquentRedisMirror\Concerns\ResolvesRedisRelations;
 use PetkaKahin\EloquentRedisMirror\Contracts\HasRedisCacheInterface;
@@ -20,6 +22,14 @@ class SyncRedisHash
 
     /** @var array<class-string, array<string, array{foreignKey: string, parentClass: class-string<Model>}>> */
     protected static array $belongsToCache = [];
+
+    /**
+     * Reset static caches. Call in test teardown to prevent cross-test pollution.
+     */
+    public static function resetCache(): void
+    {
+        static::$belongsToCache = [];
+    }
 
     public function __construct(
         protected RedisRepository $repository,
@@ -89,24 +99,32 @@ class SyncRedisHash
         /** @var array<string, list<int|string>> $removeEntries */
         $removeEntries = [];
 
+        $scoreDirty = method_exists($model, 'getRedisSortScore')
+            || in_array($this->getSortField($model), $dirty, true);
+
         foreach ($infos as $info) {
             $fk = $info['fk'];
 
-            if (!in_array($fk, $dirty, true)) {
-                continue;
-            }
+            if (in_array($fk, $dirty, true)) {
+                $oldFk = $model->getOriginal($fk);
+                $newFk = $model->getAttribute($fk);
 
-            $oldFk = $model->getOriginal($fk);
-            $newFk = $model->getAttribute($fk);
+                if ($oldFk !== null) {
+                    $oldIndexKey                   = $info['parentPrefix'] . ':' . $oldFk . ':' . $info['reverseRelation'];
+                    $removeEntries[$oldIndexKey][] = $modelKey;
+                }
 
-            if ($oldFk !== null) {
-                $oldIndexKey                   = $info['parentPrefix'] . ':' . $oldFk . ':' . $info['reverseRelation'];
-                $removeEntries[$oldIndexKey][] = $modelKey;
-            }
+                if ($newFk !== null) {
+                    $newIndexKey                        = $info['parentPrefix'] . ':' . $newFk . ':' . $info['reverseRelation'];
+                    $addEntries[$newIndexKey][$modelKey] = $score;
+                }
+            } elseif ($scoreDirty) {
+                $parentId = $model->getAttribute($fk);
 
-            if ($newFk !== null) {
-                $newIndexKey                        = $info['parentPrefix'] . ':' . $newFk . ':' . $info['reverseRelation'];
-                $addEntries[$newIndexKey][$modelKey] = $score;
+                if ($parentId !== null) {
+                    $indexKey                        = $info['parentPrefix'] . ':' . $parentId . ':' . $info['reverseRelation'];
+                    $addEntries[$indexKey][$modelKey] = $score;
+                }
             }
         }
 
@@ -144,11 +162,88 @@ class SyncRedisHash
             }
         }
 
-        // Delete child indices along with their warmed flags
+        // Collect child index keys and identify BelongsToMany relations for batch cleanup
+        /** @var array<string, array{pivotTable: string, relInstance: BelongsToMany<Model, Model>}> $btmRelations */
+        $btmRelations = [];
+        /** @var list<string> $btmIndexKeys */
+        $btmIndexKeys = [];
+
         foreach ($model->getRedisRelations() as $relation) {
             $indexKey     = $model->getRedisIndexKey($relation);
             $deleteKeys[] = $indexKey;
             $deleteKeys[] = $indexKey . ':warmed';
+
+            if (!method_exists($model, $relation)) {
+                continue;
+            }
+
+            try {
+                $relInstance = $model->$relation();
+            } catch (Exception) {
+                continue;
+            }
+
+            if ($relInstance instanceof BelongsToMany) {
+                $btmRelations[$indexKey] = [
+                    'pivotTable'  => $relInstance->getTable(),
+                    'relInstance' => $relInstance,
+                ];
+                $btmIndexKeys[] = $indexKey;
+            }
+        }
+
+        // Batch-fetch all BTM member IDs in a single pipeline call
+        if (!empty($btmIndexKeys)) {
+            $batchMemberIds = $this->repository->getManyRelationIds($btmIndexKeys);
+
+            foreach ($btmRelations as $indexKey => $btmInfo) {
+                $memberIds = $batchMemberIds[$indexKey] ?? [];
+
+                // If Redis index was never warmed, fall back to DB pivot table
+                if (empty($memberIds) && !isset($batchMemberIds[$indexKey])) {
+                    $relInstance = $btmInfo['relInstance'];
+                    $foreignPivotKey = $relInstance->getForeignPivotKeyName();
+                    $relatedPivotKey = $relInstance->getRelatedPivotKeyName();
+                    try {
+                        $memberIds = DB::table($btmInfo['pivotTable'])
+                            ->where($foreignPivotKey, $model->getKey())
+                            ->pluck($relatedPivotKey)
+                            ->map(static fn ($id): string => (string) $id)
+                            ->all();
+                    } catch (Exception) {
+                        // DB unavailable — skip cleanup for this relation
+                    }
+                }
+
+                if (empty($memberIds)) {
+                    continue;
+                }
+
+                $pivotTable   = $btmInfo['pivotTable'];
+                $relInstance   = $btmInfo['relInstance'];
+                $relatedModel = $relInstance->getRelated();
+
+                // Pre-resolve reverse relations once per BTM relation (not per member)
+                /** @var list<array{prefix: string, relation: string}> $reverseInfos */
+                $reverseInfos = [];
+                if ($this->usesRedisCache($relatedModel)) {
+                    /** @var Model&HasRedisCacheInterface $relatedModel */
+                    $reverseRelations = $this->findAllReverseRelationNames($relatedModel, $model);
+                    $relatedPrefix = $relatedModel::getRedisPrefix();
+                    foreach ($reverseRelations as $reverseRelation) {
+                        $reverseInfos[] = ['prefix' => $relatedPrefix, 'relation' => $reverseRelation];
+                    }
+                }
+
+                foreach ($memberIds as $memberId) {
+                    $deleteKeys[] = $pivotTable . ':' . $model->getKey() . ':' . $memberId;
+
+                    foreach ($reverseInfos as $ri) {
+                        $reverseIndexKey = $ri['prefix'] . ':' . $memberId . ':' . $ri['relation'];
+                        $removeEntries[$reverseIndexKey][] = (string) $model->getKey();
+                    }
+                }
+            }
         }
 
         $this->repository->executeBatch(
@@ -209,18 +304,21 @@ class SyncRedisHash
                 continue;
             }
 
-            $reverseRelation = $this->findReverseRelationName($parentClass, $model);
+            $reverseRelations = $this->findAllReverseRelationNames($parentClass, $model);
 
-            if ($reverseRelation === null) {
+            if (empty($reverseRelations)) {
                 continue;
             }
 
             /** @var class-string<Model&HasRedisCacheInterface> $parentClass */
-            $infos[] = [
-                'fk'              => $info['foreignKey'],
-                'parentPrefix'    => $parentClass::getRedisPrefix(),
-                'reverseRelation' => $reverseRelation,
-            ];
+            $parentPrefix = $parentClass::getRedisPrefix();
+            foreach ($reverseRelations as $reverseRelation) {
+                $infos[] = [
+                    'fk'              => $info['foreignKey'],
+                    'parentPrefix'    => $parentPrefix,
+                    'reverseRelation' => $reverseRelation,
+                ];
+            }
         }
 
         return $infos;

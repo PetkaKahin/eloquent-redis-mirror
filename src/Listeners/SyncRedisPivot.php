@@ -52,7 +52,7 @@ class SyncRedisPivot
 
         [$indexEntries, $pivotItems] = $this->buildAttachEntries(
             $event->ids, $ctx['indexKey'], $scores, $parentScore,
-            $ctx['parentId'], $ctx['reverseInfo'], $ctx['pivotTable'],
+            $ctx['parentId'], $ctx['reverseInfos'], $ctx['pivotTable'],
             $ctx['foreignPivotKey'], $ctx['relatedPivotKey'], $event->pivotAttributes,
         );
 
@@ -70,7 +70,7 @@ class SyncRedisPivot
         }
 
         [$removeEntries, $pivotKeysToDelete] = $this->buildDetachEntries(
-            $event->ids, $ctx['indexKey'], $ctx['parentId'], $ctx['reverseInfo'], $ctx['pivotTable'],
+            $event->ids, $ctx['indexKey'], $ctx['parentId'], $ctx['reverseInfos'], $ctx['pivotTable'],
         );
 
         $this->repository->executeBatch(
@@ -92,7 +92,7 @@ class SyncRedisPivot
 
         ['relatedModel' => $relatedModel, 'pivotTable' => $pivotTable,
          'foreignPivotKey' => $foreignPivotKey, 'relatedPivotKey' => $relatedPivotKey,
-         'parentId' => $parentId, 'indexKey' => $indexKey, 'reverseInfo' => $reverseInfo] = $ctx;
+         'parentId' => $parentId, 'indexKey' => $indexKey, 'reverseInfos' => $reverseInfos] = $ctx;
 
         /** @var list<int|string> $attachedIds */
         $attachedIds = array_keys($event->pivotAttributes);
@@ -110,22 +110,16 @@ class SyncRedisPivot
 
             // For IDs that already exist in Redis (updated pivot, not newly attached),
             // merge existing pivot data so that columns like created_at are not lost.
+            $existingPivots = $this->fetchExistingPivotData(
+                $attachedIds, $pivotTable, $foreignPivotKey, $relatedPivotKey, $parentId,
+            );
+
             $mergedPivotAttributes = $event->pivotAttributes;
-            /** @var list<string> $existingPivotKeys */
-            $existingPivotKeys = [];
-            /** @var array<string, int|string> $pivotKeyToAttachedId */
-            $pivotKeyToAttachedId = [];
             foreach ($attachedIds as $aid) {
                 /** @var int|string $aid */
                 $pKey = $pivotTable . ':' . $parentId . ':' . $aid;
-                $existingPivotKeys[] = $pKey;
-                $pivotKeyToAttachedId[$pKey] = $aid;
-            }
-
-            $existingPivots = $this->repository->getMany($existingPivotKeys);
-            foreach ($existingPivots as $pKey => $existingData) {
+                $existingData = $existingPivots[$pKey] ?? null;
                 if ($existingData !== null) {
-                    $aid = $pivotKeyToAttachedId[$pKey];
                     /** @var array<string, mixed> $merged */
                     $merged = array_merge($existingData, $mergedPivotAttributes[$aid] ?? []);
                     $mergedPivotAttributes[$aid] = $merged;
@@ -134,14 +128,14 @@ class SyncRedisPivot
 
             [$indexEntries, $pivotItems] = $this->buildAttachEntries(
                 $attachedIds, $indexKey, $scores, $parentScore,
-                $parentId, $reverseInfo, $pivotTable,
+                $parentId, $reverseInfos, $pivotTable,
                 $foreignPivotKey, $relatedPivotKey, $mergedPivotAttributes,
             );
         }
 
         if (!empty($detachedIds)) {
             [$removeEntries, $pivotKeysToDelete] = $this->buildDetachEntries(
-                $detachedIds, $indexKey, $parentId, $reverseInfo, $pivotTable,
+                $detachedIds, $indexKey, $parentId, $reverseInfos, $pivotTable,
             );
         }
 
@@ -174,26 +168,63 @@ class SyncRedisPivot
         /** @var int|string $parentId */
         $parentId = $parent->getKey();
 
+        $existingData = $this->fetchExistingPivotData(
+            $event->ids, $pivotTable, $foreignPivotKey, $relatedPivotKey, $parentId,
+        );
+
+        /** @var array<string, array<string, mixed>> $toWrite */
+        $toWrite = [];
+        foreach ($event->ids as $id) {
+            $pivotKey = $pivotTable . ':' . $parentId . ':' . $id;
+            $existing = $existingData[$pivotKey] ?? [
+                $foreignPivotKey => $parentId,
+                $relatedPivotKey => $id,
+            ];
+            /** @var array<string, mixed> $mergedPivot */
+            $mergedPivot = array_merge($existing, $event->pivotAttributes[$id] ?? []);
+            $toWrite[$pivotKey] = $mergedPivot;
+        }
+
+        $this->repository->setMany($toWrite);
+    }
+
+    /**
+     * Fetch existing pivot data from Redis, falling back to DB for misses.
+     * This prevents silently dropping columns (created_at, custom attributes)
+     * when updating or syncing pivots.
+     *
+     * @param list<int|string> $ids         Related model IDs
+     * @param string           $pivotTable
+     * @param string           $foreignPivotKey
+     * @param string           $relatedPivotKey
+     * @param int|string       $parentId
+     * @return array<string, array<string, mixed>|null> pivotRedisKey => data
+     */
+    private function fetchExistingPivotData(
+        array $ids,
+        string $pivotTable,
+        string $foreignPivotKey,
+        string $relatedPivotKey,
+        int|string $parentId,
+    ): array {
         /** @var list<string> $pivotKeys */
         $pivotKeys = [];
         /** @var array<string, int|string> $pivotKeyToId */
         $pivotKeyToId = [];
 
-        foreach ($event->ids as $id) {
-            $pivotKey                = $pivotTable . ':' . $parentId . ':' . $id;
-            $pivotKeys[]             = $pivotKey;
-            $pivotKeyToId[$pivotKey] = $id;
+        foreach ($ids as $id) {
+            $pKey = $pivotTable . ':' . $parentId . ':' . $id;
+            $pivotKeys[] = $pKey;
+            $pivotKeyToId[$pKey] = $id;
         }
 
         $existingData = $this->repository->getMany($pivotKeys);
 
-        // For pivot keys absent from Redis fetch their current state from the DB so
-        // that existing columns (created_at, custom attributes) are not silently dropped.
         /** @var list<int|string> $missedIds */
         $missedIds = [];
-        foreach ($pivotKeys as $pivotKey) {
-            if ($existingData[$pivotKey] === null) {
-                $missedIds[] = $pivotKeyToId[$pivotKey];
+        foreach ($pivotKeys as $pKey) {
+            if ($existingData[$pKey] === null) {
+                $missedIds[] = $pivotKeyToId[$pKey];
             }
         }
 
@@ -205,25 +236,14 @@ class SyncRedisPivot
 
             foreach ($dbRows as $row) {
                 /** @var int|string $relId */
-                $relId                                                  = $row->{$relatedPivotKey};
-                $existingData[$pivotTable . ':' . $parentId . ':' . $relId] = (array) $row;
+                $relId = $row->{$relatedPivotKey};
+                /** @var array<string, mixed> $rowArray */
+                $rowArray = (array) $row;
+                $existingData[$pivotTable . ':' . $parentId . ':' . $relId] = $rowArray;
             }
         }
 
-        /** @var array<string, array<string, mixed>> $toWrite */
-        $toWrite = [];
-        foreach ($pivotKeys as $pivotKey) {
-            $id       = $pivotKeyToId[$pivotKey];
-            $existing = $existingData[$pivotKey] ?? [
-                $foreignPivotKey => $parentId,
-                $relatedPivotKey => $id,
-            ];
-            /** @var array<string, mixed> $mergedPivot */
-            $mergedPivot = array_merge($existing, $event->pivotAttributes[$id] ?? []);
-            $toWrite[$pivotKey] = $mergedPivot;
-        }
-
-        $this->repository->setMany($toWrite);
+        return $existingData;
     }
 
     /**
@@ -298,7 +318,7 @@ class SyncRedisPivot
      * Resolves the common context for pivot handlers (attached/detached/synced/toggled).
      * Returns null if the parent model does not use HasRedisCache.
      *
-     * @return array{relatedModel: Model, pivotTable: string, foreignPivotKey: string, relatedPivotKey: string, parentId: int|string, indexKey: string, reverseInfo: array{relation: string, prefix: string}|null}|null
+     * @return array{relatedModel: Model, pivotTable: string, foreignPivotKey: string, relatedPivotKey: string, parentId: int|string, indexKey: string, reverseInfos: list<array{relation: string, prefix: string}>}|null
      */
     private function resolveFullContext(RedisPivotChanged $event): ?array
     {
@@ -319,41 +339,49 @@ class SyncRedisPivot
         $relatedPivotKey = $relation->getRelatedPivotKeyName();
 
         /** @var int|string $parentId */
-        $parentId    = $parent->getKey();
-        $indexKey    = $parent->getRedisIndexKey($relationName);
-        $reverseInfo = $this->resolveReverseInfo($relatedModel, $parent);
+        $parentId     = $parent->getKey();
+        $indexKey     = $parent->getRedisIndexKey($relationName);
+        $reverseInfos = $this->resolveReverseInfos($relatedModel, $parent);
 
-        return compact('relatedModel', 'pivotTable', 'foreignPivotKey', 'relatedPivotKey', 'parentId', 'indexKey', 'reverseInfo');
+        return compact('relatedModel', 'pivotTable', 'foreignPivotKey', 'relatedPivotKey', 'parentId', 'indexKey', 'reverseInfos');
     }
 
     /**
-     * Resolves reverse-relation info for the related model if it uses HasRedisCache.
+     * Resolves ALL reverse-relation infos for the related model if it uses HasRedisCache.
      *
-     * @return array{relation: string, prefix: string}|null
+     * @return list<array{relation: string, prefix: string}>
      */
-    private function resolveReverseInfo(Model $relatedModel, Model $parent): ?array
+    private function resolveReverseInfos(Model $relatedModel, Model $parent): array
     {
         if (!$this->usesRedisCache($relatedModel)) {
-            return null;
+            return [];
         }
 
-        $reverseRelation = $this->findReverseRelationName($relatedModel, $parent);
+        $reverseRelations = $this->findAllReverseRelationNames($relatedModel, $parent);
 
-        if ($reverseRelation === null) {
-            return null;
+        if (empty($reverseRelations)) {
+            return [];
         }
 
         /** @var Model&HasRedisCacheInterface $relatedModel */
-        return ['relation' => $reverseRelation, 'prefix' => $relatedModel::getRedisPrefix()];
+        $prefix = $relatedModel::getRedisPrefix();
+
+        /** @var list<array{relation: string, prefix: string}> $result */
+        $result = [];
+        foreach ($reverseRelations as $rel) {
+            $result[] = ['relation' => $rel, 'prefix' => $prefix];
+        }
+
+        return $result;
     }
 
     /**
      * Builds index entries and pivot items for a list of IDs to attach.
      *
-     * @param  list<int|string>                            $ids
-     * @param  array<int|string, float>                    $scores
-     * @param  array{relation: string, prefix: string}|null $reverseInfo
-     * @param  array<int|string, array<string, mixed>>     $pivotAttributes
+     * @param  list<int|string>                                 $ids
+     * @param  array<int|string, float>                         $scores
+     * @param  list<array{relation: string, prefix: string}>    $reverseInfos
+     * @param  array<int|string, array<string, mixed>>          $pivotAttributes
      * @return array{array<string, array<int|string, float>>, array<string, array<string, mixed>>}
      */
     private function buildAttachEntries(
@@ -362,7 +390,7 @@ class SyncRedisPivot
         array $scores,
         float $parentScore,
         int|string $parentId,
-        ?array $reverseInfo,
+        array $reverseInfos,
         string $pivotTable,
         string $foreignPivotKey,
         string $relatedPivotKey,
@@ -376,8 +404,8 @@ class SyncRedisPivot
         foreach ($ids as $id) {
             $indexEntries[$indexKey][$id] = $scores[$id] ?? (float) time();
 
-            if ($reverseInfo !== null) {
-                $reverseIndexKey = $reverseInfo['prefix'] . ':' . $id . ':' . $reverseInfo['relation'];
+            foreach ($reverseInfos as $ri) {
+                $reverseIndexKey = $ri['prefix'] . ':' . $id . ':' . $ri['relation'];
                 $indexEntries[$reverseIndexKey][(string) $parentId] = $parentScore;
             }
 
@@ -394,15 +422,15 @@ class SyncRedisPivot
     /**
      * Builds remove-index entries and pivot keys to delete for a list of IDs to detach.
      *
-     * @param  list<int|string>                            $ids
-     * @param  array{relation: string, prefix: string}|null $reverseInfo
+     * @param  list<int|string>                                 $ids
+     * @param  list<array{relation: string, prefix: string}>    $reverseInfos
      * @return array{array<string, list<int|string>>, list<string>}
      */
     private function buildDetachEntries(
         array $ids,
         string $indexKey,
         int|string $parentId,
-        ?array $reverseInfo,
+        array $reverseInfos,
         string $pivotTable,
     ): array {
         /** @var array<string, list<int|string>> $removeEntries */
@@ -413,8 +441,8 @@ class SyncRedisPivot
         foreach ($ids as $id) {
             $removeEntries[$indexKey][] = $id;
 
-            if ($reverseInfo !== null) {
-                $reverseIndexKey = $reverseInfo['prefix'] . ':' . $id . ':' . $reverseInfo['relation'];
+            foreach ($reverseInfos as $ri) {
+                $reverseIndexKey = $ri['prefix'] . ':' . $id . ':' . $ri['relation'];
                 $removeEntries[$reverseIndexKey][] = (string) $parentId;
             }
 
