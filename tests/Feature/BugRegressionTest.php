@@ -14,6 +14,7 @@ use PetkaKahin\EloquentRedisMirror\Concerns\RedisRelationCache;
 use PetkaKahin\EloquentRedisMirror\Events\RedisModelChanged;
 use PetkaKahin\EloquentRedisMirror\Repository\RedisRepository;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\Category;
+use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\CustomScoreTask;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\Project;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\SoftDeletableTask;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\Tag;
@@ -613,4 +614,254 @@ it('[COMBO] warm/cold split с HasOne возвращает модель не к�
         expect($proj->firstCategory)->toBeInstanceOf(Category::class);
         expect($proj->firstCategory)->not->toBeInstanceOf(\Illuminate\Database\Eloquent\Collection::class);
     }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// BUG 3.1: scoreDirty always true with getRedisSortScore()
+//
+// Old code: method_exists($model, 'getRedisSortScore') || in_array(...)
+// This made scoreDirty=true for EVERY update when getRedisSortScore()
+// exists, causing unnecessary ZADD on every update even if score
+// didn't change.
+//
+// Fix: compare actual old vs new score from getRedisSortScore().
+// ═══════════════════════════════════════════════════════════════
+
+it('[BUG-3.1] update без изменения score НЕ вызывает ZADD для модели с getRedisSortScore', function () {
+    // CustomScoreTask has getRedisSortScore() based on sort_order.
+    // Updating title (not sort_order) should NOT re-ZADD the index.
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+    $task = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'Old', 'sort_order' => 5]);
+
+    // CustomScoreTask prefix is 'custom_score_task', index is still 'category:{id}:tasks'
+    $indexKey = "category:{$cat->id}:tasks";
+    $hashKey = "custom_score_task:{$task->id}";
+
+    // Record Redis state before update
+    $scoreBefore = Redis::zscore($indexKey, (string) $task->id);
+    expect((float) $scoreBefore)->toBe(5.0);
+
+    // Update title only — sort_order stays 5, score stays 5.0
+    $task->update(['title' => 'New Title']);
+
+    // Score should be unchanged (no unnecessary ZADD)
+    $scoreAfter = Redis::zscore($indexKey, (string) $task->id);
+    expect((float) $scoreAfter)->toBe((float) $scoreBefore);
+
+    // Hash should be updated
+    $cached = $this->repository->get($hashKey);
+    expect($cached['title'])->toBe('New Title');
+});
+
+it('[BUG-3.1] update с изменением score вызывает ZADD для модели с getRedisSortScore', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+    $task = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'Task', 'sort_order' => 5]);
+
+    $indexKey = "category:{$cat->id}:tasks";
+
+    $scoreBefore = Redis::zscore($indexKey, (string) $task->id);
+    expect((float) $scoreBefore)->toBe(5.0);
+
+    // Update sort_order — score changes from 5.0 to 10.0
+    $task->update(['sort_order' => 10]);
+
+    $scoreAfter = Redis::zscore($indexKey, (string) $task->id);
+    expect((float) $scoreAfter)->toBe(10.0);
+});
+
+it('[BUG-3.1] isScoreDirty корректно сравнивает score при пустом dirty', function () {
+    // touch() changes only updated_at, not sort_order — score should stay the same
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+    $task = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'Task', 'sort_order' => 5]);
+
+    $indexKey = "category:{$cat->id}:tasks";
+
+    // touch() changes only updated_at, not sort_order
+    sleep(1);
+    $task->touch();
+
+    // Score should remain 5.0 (sort_order unchanged)
+    $score = Redis::zscore($indexKey, (string) $task->id);
+    expect((float) $score)->toBe(5.0);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// BUG 3.2: Warmed flags without TTL
+//
+// Old code: $pipe->set($indexKey . ':warmed', '1') — no TTL.
+// After manual Redis cleanup (e.g. DEL specific keys), orphaned
+// :warmed flags would persist forever, making the package think
+// the index is warmed (but empty), returning empty collections.
+//
+// Fix: use setex with 24h TTL on all warmed flags.
+// ═══════════════════════════════════════════════════════════════
+
+it('[BUG-3.2] warmed флаги создаются с TTL', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+
+    // Flush to force cold-start path (which sets warmed flags)
+    Redis::flushdb();
+
+    // Cold-start warm — triggers executeBatch with markWarmed
+    Project::with('categories')->find($project->id);
+
+    $warmedKey = "project:{$project->id}:categories:warmed";
+
+    // Warmed flag should exist
+    expect(Redis::exists($warmedKey))->toBeTruthy();
+
+    // TTL should be set (> 0, not -1 which means no expiry)
+    $ttl = Redis::ttl($warmedKey);
+    expect($ttl)->toBeGreaterThan(0)
+        ->and($ttl)->toBeLessThanOrEqual(86400);
+});
+
+it('[BUG-3.2] warmed флаги через executeBatch тоже имеют TTL', function () {
+    // executeBatch with markWarmed parameter also uses setex
+    $this->repository->executeBatch(
+        markWarmed: ['test:index:1', 'test:index:2'],
+    );
+
+    foreach (['test:index:1:warmed', 'test:index:2:warmed'] as $key) {
+        expect(Redis::exists($key))->toBeTruthy();
+
+        $ttl = Redis::ttl($key);
+        expect($ttl)->toBeGreaterThan(0)
+            ->and($ttl)->toBeLessThanOrEqual(86400);
+    }
+});
+
+it('[BUG-3.2] markIndicesWarmed устанавливает TTL на все флаги', function () {
+    $this->repository->markIndicesWarmed(['idx:a', 'idx:b', 'idx:c']);
+
+    foreach (['idx:a:warmed', 'idx:b:warmed', 'idx:c:warmed'] as $key) {
+        $ttl = Redis::ttl($key);
+        expect($ttl)->toBeGreaterThan(0)
+            ->and($ttl)->toBeLessThanOrEqual(86400);
+    }
+});
+
+it('[BUG-3.2] после ручной очистки индекса warmed TTL позволяет cold-start', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+
+    // Flush to force cold-start, then warm
+    Redis::flushdb();
+    Project::with('categories')->find($project->id);
+
+    $indexKey = "project:{$project->id}:categories";
+
+    // Verify warmed flag exists after cold-start
+    expect(Redis::exists($indexKey . ':warmed'))->toBeTruthy();
+
+    // Simulate manual DEL of the sorted set only (not warmed flag)
+    Redis::del($indexKey);
+
+    // While warmed flag still exists, getRelationIdsChecked returns []
+    // (warmed but empty). This is the scenario the TTL fixes —
+    // after TTL expires, it will return null (cold-start needed).
+    $ids = $this->repository->getRelationIdsChecked($indexKey);
+    expect($ids)->toBe([]);
+
+    // Simulate TTL expiry by deleting the warmed flag
+    Redis::del($indexKey . ':warmed');
+
+    // Now should return null → triggers cold-start from DB
+    $ids = $this->repository->getRelationIdsChecked($indexKey);
+    expect($ids)->toBeNull();
+
+    // Full flow: with() should now fallback to DB and re-warm
+    $loaded = Project::with('categories')->find($project->id);
+    expect($loaded->categories)->toHaveCount(1)
+        ->and($loaded->categories->first()->name)->toBe('Cat');
+});
+
+// ═══════════════════════════════════════════════════════════════
+// BUG 3.3: Pipeline without transactions (executeBatch)
+//
+// Old code: Redis::pipeline() — not atomic, partial writes possible.
+// Fix: Redis::transaction() — MULTI/EXEC, all-or-nothing.
+//
+// Note: testing true atomicity (Redis crash mid-write) is not
+// feasible in integration tests. These tests verify that
+// executeBatch still works correctly with transaction semantics.
+// ═══════════════════════════════════════════════════════════════
+
+it('[BUG-3.3] executeBatch атомарно выполняет set + index + delete + warmed', function () {
+    // Pre-populate some data to delete
+    $this->repository->set('old:1', ['id' => 1]);
+    $this->repository->addToIndex('old:index', 99, 100.0);
+
+    // Single executeBatch with all operation types
+    $this->repository->executeBatch(
+        setItems: ['new:1' => ['id' => 1, 'name' => 'Test']],
+        deleteKeys: ['old:1'],
+        addToIndices: ['new:index' => [1 => 100.0, 2 => 200.0]],
+        removeFromIndices: ['old:index' => [99]],
+        markWarmed: ['new:index'],
+    );
+
+    // All operations should have completed atomically
+    expect($this->repository->get('new:1'))->toBe(['id' => 1, 'name' => 'Test']);
+    expect($this->repository->get('old:1'))->toBeNull();
+    expect($this->repository->getRelationIds('new:index'))->toBe(['1', '2']);
+    expect($this->repository->getRelationIds('old:index'))->toBeEmpty();
+    expect(Redis::exists('new:index:warmed'))->toBeTruthy();
+});
+
+it('[BUG-3.3] executeBatch с невалидным JSON прерывает до транзакции', function () {
+    // Pre-encode happens BEFORE the transaction starts.
+    // If json_encode fails, no partial writes should occur.
+    $this->repository->set('existing:1', ['name' => 'should survive']);
+
+    $resource = fopen('php://memory', 'r');
+
+    try {
+        $this->repository->executeBatch(
+            setItems: [
+                'good:1' => ['name' => 'ok'],
+                'bad:1' => ['resource' => $resource], // json_encode will throw
+            ],
+            deleteKeys: ['existing:1'],
+        );
+    } catch (\JsonException) {
+        // Expected
+    } finally {
+        fclose($resource);
+    }
+
+    // existing:1 should NOT have been deleted (transaction never started)
+    expect($this->repository->get('existing:1'))->not->toBeNull();
+    // good:1 should NOT have been written either
+    expect($this->repository->get('good:1'))->toBeNull();
+});
+
+it('[BUG-3.3] full flow: create + update через executeBatch транзакционно обновляют Redis', function () {
+    // End-to-end: create a model, then update it. Both go through executeBatch.
+    // Verify the final state is consistent.
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+    $t1 = Task::create(['category_id' => $cat->id, 'title' => 'Task 1']);
+    $t2 = Task::create(['category_id' => $cat->id, 'title' => 'Task 2']);
+
+    // Both tasks should be in the index
+    $ids = $this->repository->getRelationIds("category:{$cat->id}:tasks");
+    expect($ids)->toContain((string) $t1->id)
+        ->and($ids)->toContain((string) $t2->id);
+
+    // Move t1 to a new category — executeBatch removes from old index + adds to new
+    $cat2 = Category::create(['project_id' => $project->id, 'name' => 'Cat 2']);
+    $t1->update(['category_id' => $cat2->id]);
+
+    // Old index should not contain t1, new index should
+    $oldIds = $this->repository->getRelationIds("category:{$cat->id}:tasks");
+    $newIds = $this->repository->getRelationIds("category:{$cat2->id}:tasks");
+
+    expect($oldIds)->not->toContain((string) $t1->id)
+        ->and($oldIds)->toContain((string) $t2->id)
+        ->and($newIds)->toContain((string) $t1->id);
 });

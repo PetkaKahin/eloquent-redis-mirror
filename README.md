@@ -188,6 +188,7 @@ $project->tags()->detach(5);
 ├─────────────────────────────────────────────────────────────┤
 │  Слой 3: RedisRepository                                    │
 │  Обёртка над Redis (GET/SET/ZADD/ZRANGE/ZCARD)              │
+│  Batch-записи через MULTI/EXEC (атомарные транзакции)       │
 │  Не знает про Eloquent — принимает string/array/int         │
 ├─────────────────────────────────────────────────────────────┤
 │  Слой 4: Events + Listeners                                 │
@@ -203,6 +204,7 @@ $project->tags()->detach(5);
 - **RedisBuilder** читает Redis только через RedisRepository
 - **Listeners** работают с Redis только через RedisRepository
 - **RedisRepository** не знает про Eloquent — принимает `string`/`array`/`int`
+- **RedisRepository::executeBatch()** использует `MULTI/EXEC` — атомарная транзакция, при сбое Redis partial writes невозможны
 - **HasRedisCache** trait не содержит логики кеширования — только конфигурация
 
 ---
@@ -281,7 +283,10 @@ $project->tags()->attach([5, 8], ['role' => 'primary'])
 |-----|--------|--------|
 | Модель | `{snake_case}:{id}` | `project:7` |
 | Индекс | `{snake_case}:{id}:{relation}` | `project:7:categories` |
+| Warmed-флаг | `{index_key}:warmed` | `project:7:categories:warmed` |
 | Pivot-запись | `{pivot_table}:{parent_id}:{related_id}` | `project_tag:7:5` |
+
+Warmed-флаги имеют TTL 24 часа. При истечении — автоматический cold-start из БД (без потери данных).
 
 ---
 
@@ -319,6 +324,10 @@ $project->tags()->attach([5, 8], ['role' => 'primary'])
 
 Все операции fallback на Postgres через стандартный Eloquent. WRITE-операции записывают в Postgres, listener ловит исключение Redis и логирует. При восстановлении Redis — данные прогреются через cold start.
 
+### Атомарность записи в Redis
+
+Batch-операции (`executeBatch`) используют `MULTI/EXEC` — атомарную транзакцию Redis. Если Redis упадёт mid-write, ни одна команда из батча не выполнится. Partial state (модель обновлена, но индекс нет) невозможен.
+
 ### Race conditions
 
 Два параллельных обновления одной записи: оба пишут в Postgres (разруливается транзакциями), оба кидают event, второй listener перезапишет Redis. Итог корректный — last-write-wins, source of truth всегда Postgres.
@@ -326,6 +335,10 @@ $project->tags()->attach([5, 8], ['role' => 'primary'])
 ### SoftDeletes
 
 Модели с `SoftDeletes` полностью поддерживаются. `find()` корректно проверяет `deleted_at` из Redis-кеша через global scopes. `restored` event синхронизирует восстановленную запись обратно в Redis.
+
+### Оптимизация score-пересчёта
+
+При обновлении модели ZADD для индексов выполняется только если sort score реально изменился. Для моделей с `getRedisSortScore()` пакет сравнивает текущий и предыдущий score — лишних ZADD нет.
 
 ### Только Eloquent-операции
 
@@ -340,13 +353,20 @@ src/
 ├── Traits/
 │   └── HasRedisCache.php              # Trait для модели
 ├── Builder/
-│   └── RedisBuilder.php               # Кастомный Eloquent Builder
+│   ├── RedisBuilder.php               # Кастомный Eloquent Builder
+│   └── EagerLoad/
+│       ├── EagerLoadStrategy.php      # Interface для стратегий
+│       ├── FetchesRelatedModels.php   # Shared trait для загрузки моделей
+│       ├── BelongsToLoader.php        # FK на parent, без sorted set
+│       ├── HasManyLoader.php          # HasMany + HasOne (sorted set)
+│       └── BelongsToManyLoader.php    # Pivot + sorted set
 ├── Repository/
-│   └── RedisRepository.php            # Обёртка над Redis-командами
+│   └── RedisRepository.php            # Обёртка над Redis (MULTI/EXEC)
 ├── Relations/
 │   └── RedisBelongsToMany.php         # BelongsToMany с event dispatch
 ├── Concerns/
-│   └── ResolvesRedisRelations.php     # Shared: reverse relations, scoring
+│   ├── RedisRelationCache.php         # Global static cache (shared)
+│   └── ResolvesRedisRelations.php     # Reverse relations, scoring
 ├── Contracts/
 │   └── HasRedisCacheInterface.php     # Внутренний контракт
 ├── Events/
@@ -371,7 +391,7 @@ make tests
 make stan
 ```
 
-Покрытие: 192 теста — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints).
+Покрытие: 282 теста — unit (RedisRepository), integration (Builder, Events, Listeners, Relations, Trait), feature (полные end-to-end сценарии), regression (SoftDeletes, relation scoping, FK constraints, BelongsTo eager load, warm/cold split, scoreDirty, warmed TTL, transaction atomicity).
 
 ---
 

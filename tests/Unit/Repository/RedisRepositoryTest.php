@@ -402,6 +402,187 @@ it('getRelationCount после добавления и удаления', funct
     expect($this->repository->getRelationCount('project:7:categories'))->toBe(2);
 });
 
+// ─── markIndicesWarmed() ─────────────────────────────────────
+
+it('markIndicesWarmed устанавливает warmed флаги с TTL', function () {
+    $this->repository->markIndicesWarmed(['idx:a', 'idx:b']);
+
+    expect(Redis::get('idx:a:warmed'))->toBe('1');
+    expect(Redis::get('idx:b:warmed'))->toBe('1');
+
+    // TTL should be set (> 0), not persistent (-1)
+    expect(Redis::ttl('idx:a:warmed'))->toBeGreaterThan(0);
+    expect(Redis::ttl('idx:b:warmed'))->toBeGreaterThan(0);
+});
+
+it('markIndicesWarmed с пустым массивом не вызывает ошибку', function () {
+    $this->repository->markIndicesWarmed([]);
+})->throwsNoExceptions();
+
+// ─── executeBatch() ─────────────────────────────────────────
+
+it('executeBatch выполняет все операции атомарно', function () {
+    $this->repository->set('to_delete:1', ['id' => 1]);
+    $this->repository->addToIndex('to_clean:idx', 42, 100.0);
+
+    $this->repository->executeBatch(
+        setItems: ['new:1' => ['id' => 1]],
+        deleteKeys: ['to_delete:1'],
+        addToIndices: ['new:idx' => [10 => 50.0]],
+        removeFromIndices: ['to_clean:idx' => [42]],
+        markWarmed: ['new:idx'],
+    );
+
+    expect($this->repository->get('new:1'))->toBe(['id' => 1]);
+    expect($this->repository->get('to_delete:1'))->toBeNull();
+    expect($this->repository->getRelationIds('new:idx'))->toBe(['10']);
+    expect($this->repository->getRelationIds('to_clean:idx'))->toBeEmpty();
+    expect(Redis::exists('new:idx:warmed'))->toBeTruthy();
+});
+
+it('executeBatch warmed флаги получают TTL', function () {
+    $this->repository->executeBatch(
+        markWarmed: ['batch:idx:1', 'batch:idx:2'],
+    );
+
+    expect(Redis::ttl('batch:idx:1:warmed'))->toBeGreaterThan(0);
+    expect(Redis::ttl('batch:idx:2:warmed'))->toBeGreaterThan(0);
+});
+
+it('executeBatch с пустыми аргументами — ранний возврат', function () {
+    $this->repository->executeBatch();
+})->throwsNoExceptions();
+
+it('executeBatch pre-encode ошибка не оставляет partial writes', function () {
+    $this->repository->set('survivor:1', ['name' => 'alive']);
+
+    $resource = fopen('php://memory', 'r');
+    try {
+        $this->repository->executeBatch(
+            setItems: ['bad:1' => ['res' => $resource]],
+            deleteKeys: ['survivor:1'],
+        );
+    } catch (\JsonException) {
+        // expected
+    } finally {
+        fclose($resource);
+    }
+
+    // survivor should NOT be deleted (json_encode failed before transaction)
+    expect($this->repository->get('survivor:1'))->not->toBeNull();
+    expect($this->repository->get('bad:1'))->toBeNull();
+});
+
+// ─── getRelationIdsChecked() ────────────────────────────────
+
+it('getRelationIdsChecked возвращает null для непрогретого индекса', function () {
+    expect($this->repository->getRelationIdsChecked('cold:index'))->toBeNull();
+});
+
+it('getRelationIdsChecked возвращает пустой массив для прогретого пустого индекса', function () {
+    $this->repository->markIndicesWarmed(['empty:index']);
+
+    expect($this->repository->getRelationIdsChecked('empty:index'))->toBe([]);
+});
+
+it('getRelationIdsChecked возвращает ID для прогретого индекса', function () {
+    $this->repository->addToIndex('warm:index', 1, 100.0);
+    $this->repository->addToIndex('warm:index', 2, 200.0);
+    $this->repository->markIndicesWarmed(['warm:index']);
+
+    $result = $this->repository->getRelationIdsChecked('warm:index');
+    expect($result)->toBe(['1', '2']);
+});
+
+// ─── getRelationCountChecked() ──────────────────────────────
+
+it('getRelationCountChecked возвращает null для непрогретого индекса', function () {
+    expect($this->repository->getRelationCountChecked('cold:index'))->toBeNull();
+});
+
+it('getRelationCountChecked возвращает 0 для прогретого пустого индекса', function () {
+    $this->repository->markIndicesWarmed(['empty:index']);
+
+    expect($this->repository->getRelationCountChecked('empty:index'))->toBe(0);
+});
+
+it('getRelationCountChecked возвращает count для прогретого индекса', function () {
+    $this->repository->addToIndex('warm:index', 1, 100.0);
+    $this->repository->addToIndex('warm:index', 2, 200.0);
+    $this->repository->markIndicesWarmed(['warm:index']);
+
+    expect($this->repository->getRelationCountChecked('warm:index'))->toBe(2);
+});
+
+// ─── getManyRelationIds() ───────────────────────────────────
+
+it('getManyRelationIds возвращает null для непрогретых индексов', function () {
+    $result = $this->repository->getManyRelationIds(['cold:a', 'cold:b']);
+
+    expect($result['cold:a'])->toBeNull();
+    expect($result['cold:b'])->toBeNull();
+});
+
+it('getManyRelationIds различает прогретые пустые и непрогретые', function () {
+    $this->repository->markIndicesWarmed(['warmed:a']);
+    // cold:b not warmed
+
+    $result = $this->repository->getManyRelationIds(['warmed:a', 'cold:b']);
+
+    expect($result['warmed:a'])->toBe([]);  // warmed but empty
+    expect($result['cold:b'])->toBeNull();   // not warmed → null
+});
+
+it('getManyRelationIds с пустым массивом', function () {
+    expect($this->repository->getManyRelationIds([]))->toBe([]);
+});
+
+// ─── deleteIndices() ────────────────────────────────────────
+
+it('deleteIndices удаляет индексы вместе с warmed флагами', function () {
+    $this->repository->addToIndex('idx:a', 1, 100.0);
+    $this->repository->addToIndex('idx:b', 2, 200.0);
+    $this->repository->markIndicesWarmed(['idx:a', 'idx:b']);
+
+    $this->repository->deleteIndices(['idx:a', 'idx:b']);
+
+    expect($this->repository->getRelationIds('idx:a'))->toBeEmpty();
+    expect($this->repository->getRelationIds('idx:b'))->toBeEmpty();
+    expect(Redis::exists('idx:a:warmed'))->toBeFalsy();
+    expect(Redis::exists('idx:b:warmed'))->toBeFalsy();
+});
+
+it('deleteIndices с пустым массивом не вызывает ошибку', function () {
+    $this->repository->deleteIndices([]);
+})->throwsNoExceptions();
+
+// ─── addToIndicesBatch() / removeFromIndicesBatch() ─────────
+
+it('addToIndicesBatch добавляет в несколько индексов за один pipeline', function () {
+    $this->repository->addToIndicesBatch([
+        'idx:a' => [1 => 100.0, 2 => 200.0],
+        'idx:b' => [3 => 300.0],
+    ]);
+
+    expect($this->repository->getRelationIds('idx:a'))->toBe(['1', '2']);
+    expect($this->repository->getRelationIds('idx:b'))->toBe(['3']);
+});
+
+it('removeFromIndicesBatch удаляет из нескольких индексов', function () {
+    $this->repository->addToIndicesBatch([
+        'idx:a' => [1 => 100.0, 2 => 200.0],
+        'idx:b' => [3 => 300.0, 4 => 400.0],
+    ]);
+
+    $this->repository->removeFromIndicesBatch([
+        'idx:a' => [1],
+        'idx:b' => [3],
+    ]);
+
+    expect($this->repository->getRelationIds('idx:a'))->toBe(['2']);
+    expect($this->repository->getRelationIds('idx:b'))->toBe(['4']);
+});
+
 // ─── Отказоустойчивость ─────────────────────────────────────
 
 it('методы чтения корректно обрабатывают ConnectionException при недоступном Redis', function () {

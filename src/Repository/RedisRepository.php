@@ -8,6 +8,12 @@ use JsonException;
 class RedisRepository
 {
     /**
+     * TTL for warmed flags in seconds (24 hours).
+     * Prevents orphaned flags after manual Redis cleanup (e.g. selective DEL).
+     * Expiry only causes a cold-start re-population from DB — no data loss.
+     */
+    protected const WARMED_TTL = 86400;
+    /**
      * @return array<string, mixed>|null
      * @throws JsonException
      */
@@ -160,7 +166,7 @@ class RedisRepository
 
         Redis::pipeline(static function ($pipe) use ($indexKeys): void { // @phpstan-ignore-line
             foreach ($indexKeys as $indexKey) {
-                $pipe->set($indexKey . ':warmed', '1');
+                $pipe->setex($indexKey . ':warmed', self::WARMED_TTL, '1');
             }
         });
     }
@@ -297,7 +303,7 @@ class RedisRepository
             $encodedItems[$key] = json_encode($attributes, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
         }
 
-        Redis::pipeline(static function ($pipe) use ($encodedItems, $deleteKeys, $addToIndices, $removeFromIndices, $markWarmed): void { // @phpstan-ignore-line
+        Redis::transaction(static function ($pipe) use ($encodedItems, $deleteKeys, $addToIndices, $removeFromIndices, $markWarmed): void { // @phpstan-ignore-line
             foreach ($encodedItems as $key => $json) {
                 $pipe->set($key, $json);
             }
@@ -319,7 +325,7 @@ class RedisRepository
             }
 
             foreach ($markWarmed as $indexKey) {
-                $pipe->set($indexKey . ':warmed', '1');
+                $pipe->setex($indexKey . ':warmed', self::WARMED_TTL, '1');
             }
         });
     }

@@ -99,8 +99,7 @@ class SyncRedisHash
         /** @var array<string, list<int|string>> $removeEntries */
         $removeEntries = [];
 
-        $scoreDirty = method_exists($model, 'getRedisSortScore')
-            || in_array($this->getSortField($model), $dirty, true);
+        $scoreDirty = $this->isScoreDirty($model, $dirty);
 
         foreach ($infos as $info) {
             $fk = $info['fk'];
@@ -250,6 +249,35 @@ class SyncRedisHash
             deleteKeys: $deleteKeys,
             removeFromIndices: $removeEntries,
         );
+    }
+
+    /**
+     * Check if the sort score has actually changed for the given dirty fields.
+     *
+     * @param Model&HasRedisCacheInterface $model
+     * @param list<string> $dirty
+     */
+    protected function isScoreDirty(Model $model, array $dirty): bool
+    {
+        if (empty($dirty)) {
+            return false;
+        }
+
+        if (method_exists($model, 'getRedisSortScore')) {
+            /** @var float|int $newScore */
+            $newScore = $model->getRedisSortScore();
+
+            /** @var Model&HasRedisCacheInterface $original */
+            $original = $model->newInstance([], true);
+            $original->setRawAttributes($model->getOriginal(), true);
+
+            /** @var float|int $oldScore */
+            $oldScore = $original->getRedisSortScore(); // @phpstan-ignore method.notFound
+
+            return (float) $newScore !== (float) $oldScore;
+        }
+
+        return in_array($this->getSortField($model), $dirty, true);
     }
 
     /**

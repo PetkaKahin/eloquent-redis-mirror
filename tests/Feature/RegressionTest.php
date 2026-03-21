@@ -7,6 +7,7 @@ use PetkaKahin\EloquentRedisMirror\Concerns\RedisRelationCache;
 use PetkaKahin\EloquentRedisMirror\Concerns\ResolvesRedisRelations;
 use PetkaKahin\EloquentRedisMirror\Repository\RedisRepository;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\Category;
+use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\CustomScoreTask;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\LexorankTask;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\Project;
 use PetkaKahin\EloquentRedisMirror\Tests\Fixtures\Models\SoftDeletableTask;
@@ -1156,6 +1157,88 @@ it('updateExistingPivot сохраняет существующие pivot дан
 // ═══════════════════════════════════════════════════════════════
 // FIX: resolveWheres caching — applyScopes called once not N times
 // ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+// FIX: scoreDirty correctly detects score changes with getRedisSortScore
+// ═══════════════════════════════════════════════════════════════
+
+it('CustomScoreTask с getRedisSortScore сохраняет score по sort_order', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+    $t1 = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'A', 'sort_order' => 10]);
+    $t2 = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'B', 'sort_order' => 5]);
+
+    // t2 (score=5) should come before t1 (score=10) in sorted set
+    $ids = $this->repository->getRelationIds("category:{$cat->id}:tasks");
+    expect($ids)->toBe([(string) $t2->id, (string) $t1->id]);
+});
+
+it('CustomScoreTask update с изменённым sort_order обновляет score в индексе', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+    $t1 = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'A', 'sort_order' => 10]);
+    $t2 = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'B', 'sort_order' => 20]);
+
+    // Initial order: t1 (10), t2 (20)
+    $ids = $this->repository->getRelationIds("category:{$cat->id}:tasks");
+    expect($ids)->toBe([(string) $t1->id, (string) $t2->id]);
+
+    // Swap order: t1 goes to 30
+    $t1->update(['sort_order' => 30]);
+
+    // New order: t2 (20), t1 (30)
+    $ids = $this->repository->getRelationIds("category:{$cat->id}:tasks");
+    expect($ids)->toBe([(string) $t2->id, (string) $t1->id]);
+});
+
+it('CustomScoreTask update без изменения sort_order НЕ меняет score', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+    $task = CustomScoreTask::create(['category_id' => $cat->id, 'title' => 'Old', 'sort_order' => 42]);
+
+    $scoreBefore = Redis::zscore("category:{$cat->id}:tasks", (string) $task->id);
+    expect((float) $scoreBefore)->toBe(42.0);
+
+    // Update title only — sort_order unchanged
+    $task->update(['title' => 'New Title']);
+
+    $scoreAfter = Redis::zscore("category:{$cat->id}:tasks", (string) $task->id);
+    expect((float) $scoreAfter)->toBe(42.0);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// FIX: warmed flags have TTL — prevents stale warmed after manual cleanup
+// ═══════════════════════════════════════════════════════════════
+
+it('warmed flags получают TTL при cold-start прогреве', function () {
+    $project = Project::create(['name' => 'Test']);
+    $cat = Category::create(['project_id' => $project->id, 'name' => 'Cat']);
+
+    // Flush to force cold-start
+    Redis::flushdb();
+
+    // Cold-start via with() — sets warmed flag
+    Project::with('categories')->find($project->id);
+
+    $ttl = Redis::ttl("project:{$project->id}:categories:warmed");
+    expect($ttl)->toBeGreaterThan(0)
+        ->and($ttl)->toBeLessThanOrEqual(86400);
+});
+
+it('warmed flags получают TTL при eager load BelongsToMany', function () {
+    $project = Project::create(['name' => 'Test']);
+    $tag = Tag::create(['name' => 'Tag']);
+    $project->tags()->attach($tag->id);
+
+    // Flush to force cold-start
+    Redis::flushdb();
+
+    Project::with('tags')->find($project->id);
+
+    $ttl = Redis::ttl("project:{$project->id}:tags:warmed");
+    expect($ttl)->toBeGreaterThan(0)
+        ->and($ttl)->toBeLessThanOrEqual(86400);
+});
 
 it('findMany с SoftDeletes корректно фильтрует deleted модели из Redis', function () {
     $project = Project::create(['name' => 'Test']);
